@@ -23,6 +23,8 @@ import (
 )
 
 func TestParseKey(t *testing.T) {
+	t.Parallel()
+
 	k, err := ParseKey("test:config:key")
 	assert.NoError(t, err)
 	assert.Equal(t, "test", k.namespace)
@@ -34,13 +36,19 @@ func TestParseKey(t *testing.T) {
 	assert.Equal(t, "key", k.name)
 
 	_, err = ParseKey("foo")
-	assert.Error(t, err)
+	assert.ErrorContains(t, err,
+		"could not parse foo as a configuration key "+
+			"(configuration keys should be of the form `<namespace>:<name>`)")
 
 	_, err = ParseKey("test:data:key")
-	assert.Error(t, err)
+	assert.ErrorContains(t, err,
+		"could not parse test:data:key as a configuration key "+
+			"(configuration keys should be of the form `<namespace>:<name>`)")
 }
 
 func TestMarshalKeyJSON(t *testing.T) {
+	t.Parallel()
+
 	k := Key{namespace: "test", name: "key"}
 
 	b, err := json.Marshal(k)
@@ -53,6 +61,8 @@ func TestMarshalKeyJSON(t *testing.T) {
 }
 
 func TestMarshalKeyYAML(t *testing.T) {
+	t.Parallel()
+
 	k := Key{namespace: "test", name: "key"}
 
 	b, err := yaml.Marshal(k)
@@ -73,7 +83,8 @@ func roundtripKeyJSON(k Key) (Key, error) {
 }
 
 func roundtripKey(m Key, marshal func(v interface{}) ([]byte, error),
-	unmarshal func([]byte, interface{}) error) (Key, error) {
+	unmarshal func([]byte, interface{}) error,
+) (Key, error) {
 	b, err := marshal(m)
 	if err != nil {
 		return Key{}, err

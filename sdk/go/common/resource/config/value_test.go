@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2022, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 package config
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -24,6 +25,8 @@ import (
 )
 
 func TestMarshallNormalValueYAML(t *testing.T) {
+	t.Parallel()
+
 	v := NewValue("value")
 
 	b, err := yaml.Marshal(v)
@@ -36,6 +39,8 @@ func TestMarshallNormalValueYAML(t *testing.T) {
 }
 
 func TestMarshallSecureValueYAML(t *testing.T) {
+	t.Parallel()
+
 	v := NewSecureValue("value")
 
 	b, err := yaml.Marshal(v)
@@ -48,6 +53,8 @@ func TestMarshallSecureValueYAML(t *testing.T) {
 }
 
 func TestMarshallNormalValueJSON(t *testing.T) {
+	t.Parallel()
+
 	v := NewValue("value")
 
 	b, err := json.Marshal(v)
@@ -60,6 +67,8 @@ func TestMarshallNormalValueJSON(t *testing.T) {
 }
 
 func TestMarshallSecureValueJSON(t *testing.T) {
+	t.Parallel()
+
 	v := NewSecureValue("value")
 
 	b, err := json.Marshal(v)
@@ -72,6 +81,8 @@ func TestMarshallSecureValueJSON(t *testing.T) {
 }
 
 func TestHasSecureValue(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		Value    interface{}
 		Expected bool
@@ -84,13 +95,6 @@ func TestHasSecureValue(t *testing.T) {
 			Value: map[string]interface{}{
 				"foo": "bar",
 				"hi":  map[string]interface{}{"secure": "securevalue", "but": "not"},
-			},
-			Expected: false,
-		},
-		{
-			Value: map[string]interface{}{
-				"foo": "bar",
-				"hi":  map[string]interface{}{"secure": 1},
 			},
 			Expected: false,
 		},
@@ -124,21 +128,27 @@ func TestHasSecureValue(t *testing.T) {
 		},
 	}
 
+	//nolint:paralleltest // false positive because range var isn't used directly in t.Run(name) arg
 	for _, test := range tests {
+		test := test
 		t.Run(fmt.Sprintf("%v", test.Value), func(t *testing.T) {
+			t.Parallel()
+
 			jsonBytes, err := json.Marshal(test.Value)
 			assert.NoError(t, err)
 
-			var val interface{}
+			var val object
 			err = json.Unmarshal(jsonBytes, &val)
 			assert.NoError(t, err)
 
-			assert.Equal(t, test.Expected, hasSecureValue(val))
+			assert.Equal(t, test.Expected, val.Secure())
 		})
 	}
 }
 
 func TestDecryptingValue(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		Value    Value
 		Expected string
@@ -179,8 +189,12 @@ func TestDecryptingValue(t *testing.T) {
 
 	decrypter := NewBlindingDecrypter()
 
+	//nolint:paralleltest // false positive because range var isn't used directly in t.Run(name) arg
 	for _, test := range tests {
+		test := test
 		t.Run(fmt.Sprintf("%v", test.Value), func(t *testing.T) {
+			t.Parallel()
+
 			actual, err := test.Value.Value(decrypter)
 			assert.NoError(t, err)
 			assert.Equal(t, test.Expected, actual)
@@ -195,11 +209,21 @@ func TestDecryptingValue(t *testing.T) {
 
 type passThroughDecrypter struct{}
 
-func (d passThroughDecrypter) DecryptValue(ciphertext string) (string, error) {
+func (d passThroughDecrypter) DecryptValue(
+	ctx context.Context, ciphertext string,
+) (string, error) {
 	return ciphertext, nil
 }
 
+func (d passThroughDecrypter) BulkDecrypt(
+	ctx context.Context, ciphertexts []string,
+) (map[string]string, error) {
+	return DefaultBulkDecrypt(ctx, d, ciphertexts)
+}
+
 func TestSecureValues(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		Value    Value
 		Expected []string
@@ -236,8 +260,12 @@ func TestSecureValues(t *testing.T) {
 
 	decrypter := passThroughDecrypter{}
 
+	//nolint:paralleltest // false positive because range var isn't used directly in t.Run(name) arg
 	for _, test := range tests {
+		test := test
 		t.Run(fmt.Sprintf("%v", test.Value), func(t *testing.T) {
+			t.Parallel()
+
 			actual, err := test.Value.SecureValues(decrypter)
 			assert.NoError(t, err)
 			assert.Equal(t, test.Expected, actual)
@@ -246,6 +274,8 @@ func TestSecureValues(t *testing.T) {
 }
 
 func TestCopyValue(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		Val      Value
 		Expected Value
@@ -272,8 +302,12 @@ func TestCopyValue(t *testing.T) {
 		},
 	}
 
+	//nolint:paralleltest // false positive because range var isn't used directly in t.Run(name) arg
 	for _, test := range tests {
+		test := test
 		t.Run(fmt.Sprintf("%v", test), func(t *testing.T) {
+			t.Parallel()
+
 			newConfig, err := test.Val.Copy(newPrefixCrypter("stackA"), newPrefixCrypter("stackB"))
 			assert.NoError(t, err)
 
@@ -291,7 +325,8 @@ func roundtripValueJSON(v Value) (Value, error) {
 }
 
 func roundtripValue(v Value, marshal func(v interface{}) ([]byte, error),
-	unmarshal func([]byte, interface{}) error) (Value, error) {
+	unmarshal func([]byte, interface{}) error,
+) (Value, error) {
 	b, err := marshal(v)
 	if err != nil {
 		return Value{}, err

@@ -1,4 +1,4 @@
-# Copyright 2016-2021, Pulumi Corporation.
+# Copyright 2016-2022, Pulumi Corporation.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -88,26 +88,29 @@ conflicts::
 
 """
 
-from ._cmd import (
-    CommandResult,
-    OnOutput
+from pulumi.automation._remote_workspace import (
+    RemoteWorkspaceOptions,
+    RemoteGitAuth,
+    create_remote_stack_git_source,
+    create_or_select_remote_stack_git_source,
+    select_remote_stack_git_source,
 )
 
-from ._config import (
-    ConfigMap,
-    ConfigValue
-)
+from pulumi.automation._remote_stack import RemoteStack
 
-# pylint: disable=redefined-builtin
+from ._cmd import CommandResult, OnOutput, PulumiCommand
+
+from ._config import ConfigMap, ConfigValue
+
 from .errors import (
     StackNotFoundError,
     StackAlreadyExistsError,
     CommandError,
     ConcurrentUpdateError,
     InlineSourceRuntimeError,
-    RuntimeError,
+    RuntimeError,  # noqa: A004 shadowing builtin
     CompilationError,
-    InvalidVersionError
+    InvalidVersionError,
 )
 
 from .events import (
@@ -126,15 +129,16 @@ from .events import (
     StepEventMetadata,
     SummaryEvent,
     OpMap,
-    OpType
+    OpType,
 )
 
 from ._local_workspace import (
     LocalWorkspace,
     LocalWorkspaceOptions,
+    Secret,
     create_stack,
     select_stack,
-    create_or_select_stack
+    create_or_select_stack,
 )
 
 from ._workspace import (
@@ -146,20 +150,17 @@ from ._workspace import (
     Deployment,
 )
 
-from ._output import (
-    OutputMap,
-    OutputValue
-)
+from ._output import OutputMap, OutputValue
 
 from ._project_settings import (
     ProjectBackend,
-    ProjectSettings,
     ProjectRuntimeInfo,
+    ProjectSettings,
+    ProjectTemplate,
+    ProjectTemplateConfigValue,
 )
 
-from ._stack_settings import (
-    StackSettings
-)
+from ._stack_settings import StackSettings
 
 from ._stack import (
     OnEvent,
@@ -175,12 +176,11 @@ from ._stack import (
 __all__ = [
     # _cmd
     "CommandResult",
+    "PulumiCommand",
     "OnOutput",
-
     # _config
     "ConfigMap",
     "ConfigValue",
-
     # errors
     "StackNotFoundError",
     "StackAlreadyExistsError",
@@ -190,7 +190,6 @@ __all__ = [
     "RuntimeError",
     "CompilationError",
     "InvalidVersionError",
-
     # events
     "CancelEvent",
     "DiagnosticEvent",
@@ -208,14 +207,13 @@ __all__ = [
     "SummaryEvent",
     "OpType",
     "OpMap",
-
     # _local_workspace
     "LocalWorkspace",
     "LocalWorkspaceOptions",
+    "Secret",
     "create_stack",
     "select_stack",
     "create_or_select_stack",
-
     # _workspace
     "PluginInfo",
     "StackSummary",
@@ -223,19 +221,17 @@ __all__ = [
     "Workspace",
     "Deployment",
     "WhoAmIResult",
-
     # _output
     "OutputMap",
     "OutputValue",
-
     # _project_settings
     "ProjectBackend",
-    "ProjectSettings",
     "ProjectRuntimeInfo",
-
+    "ProjectSettings",
+    "ProjectTemplate",
+    "ProjectTemplateConfigValue",
     # _stack_settings
     "StackSettings",
-
     # _stack
     "OnEvent",
     "Stack",
@@ -245,8 +241,15 @@ __all__ = [
     "RefreshResult",
     "DestroyResult",
     "fully_qualified_stack_name",
-
+    # _remote_workspace
+    "RemoteWorkspaceOptions",
+    "RemoteGitAuth",
+    "create_remote_stack_git_source",
+    "create_or_select_remote_stack_git_source",
+    "select_remote_stack_git_source",
+    # _remote_stack
+    "RemoteStack",
     # sub-modules
     "errors",
-    "events"
+    "events",
 ]

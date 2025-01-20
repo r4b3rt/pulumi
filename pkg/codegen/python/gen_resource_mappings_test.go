@@ -1,7 +1,21 @@
+// Copyright 2021-2024, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package python
 
 import (
-	"crypto/md5" //nolint: gosec
+	"crypto/md5" //nolint:gosec
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -15,9 +29,12 @@ import (
 // The schema is taken from `pulumi-aws` and minified to the smallest
 // example that still reproduced the issue.
 func TestGenResourceMappingsIsDeterministic(t *testing.T) {
+	t.Parallel()
+
 	minimalSchema := `
         {
             "name": "aws",
+			"version": "0.0.1",
             "meta": {
                 "moduleFormat": "(.*)(?:/[^/]*)"
             },
@@ -58,7 +75,7 @@ func TestGenResourceMappingsIsDeterministic(t *testing.T) {
 			return ""
 		}
 
-		return fmt.Sprintf("%x", md5.Sum(file)) //nolint: gosec
+		return fmt.Sprintf("%x", md5.Sum(file)) //nolint:gosec
 	}
 
 	h1 := generateInitHash()

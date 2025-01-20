@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2022, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,29 +15,34 @@
 package operations
 
 import (
+	"context"
 	"encoding/json"
-	"io/ioutil"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
 	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
+	"github.com/pulumi/pulumi/pkg/v3/secrets/b64"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 )
 
 func getPulumiResources(t *testing.T, path string) *Resource {
+	ctx := context.Background()
 	var checkpoint apitype.CheckpointV3
-	byts, err := ioutil.ReadFile(path)
+	byts, err := os.ReadFile(path)
 	assert.NoError(t, err)
 	err = json.Unmarshal(byts, &checkpoint)
 	assert.NoError(t, err)
-	snapshot, err := stack.DeserializeCheckpoint(&checkpoint)
+	snapshot, err := stack.DeserializeCheckpoint(ctx, b64.Base64SecretsProvider, &checkpoint)
 	assert.NoError(t, err)
 	resources := NewResourceTree(snapshot.Resources)
 	return resources
 }
 
 func TestTodo(t *testing.T) {
+	t.Parallel()
+
 	components := getPulumiResources(t, "testdata/todo.json")
 	assert.Equal(t, 4, len(components.Children))
 
@@ -75,6 +80,8 @@ func TestTodo(t *testing.T) {
 }
 
 func TestCrawler(t *testing.T) {
+	t.Parallel()
+
 	components := getPulumiResources(t, "testdata/crawler.json")
 	assert.Equal(t, 7, len(components.Children))
 

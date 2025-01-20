@@ -14,38 +14,38 @@
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import (
-    Callable,
-    Mapping,
-    Any,
-    List,
-    Optional
-)
+from typing import Any, Callable, List, Mapping, Optional, Awaitable
+from dataclasses import dataclass
 
-from ._stack_settings import StackSettings
-from ._project_settings import ProjectSettings
+from ._cmd import PulumiCommand
 from ._config import ConfigMap, ConfigValue
 from ._output import OutputMap
+from ._project_settings import ProjectSettings
+from ._stack_settings import StackSettings
+from ._tag import TagMap
 
-PulumiFn = Callable[[], None]
+PulumiFn = Callable[[], Optional[Awaitable[None]]]
 
 
 class StackSummary:
     """A summary of the status of a given stack."""
+
     name: str
     current: bool
-    update_in_progress: bool
+    update_in_progress: Optional[bool]
     last_update: Optional[datetime]
     resource_count: Optional[int]
     url: Optional[str]
 
-    def __init__(self,
-                 name: str,
-                 current: bool,
-                 update_in_progress: bool = False,
-                 last_update: Optional[datetime] = None,
-                 resource_count: Optional[int] = None,
-                 url: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        current: bool,
+        update_in_progress: Optional[bool] = None,
+        last_update: Optional[datetime] = None,
+        resource_count: Optional[int] = None,
+        url: Optional[str] = None,
+    ) -> None:
         self.name = name
         self.current = current
         self.update_in_progress = update_in_progress
@@ -54,12 +54,34 @@ class StackSummary:
         self.url = url
 
 
+@dataclass
+class TokenInformation:
+    """Information about the token that was used to authenticate the current user."""
+
+    name: str
+    organization: Optional[str]
+    team: Optional[str]
+
+
 class WhoAmIResult:
     """The currently logged-in Pulumi identity."""
-    user: str
 
-    def __init__(self, user: str):
+    user: str
+    url: Optional[str]
+    organizations: Optional[List[str]]
+    token_information: Optional[TokenInformation]
+
+    def __init__(
+        self,
+        user: str,
+        url: Optional[str] = None,
+        organizations: Optional[List[str]] = None,
+        token_information: Optional[TokenInformation] = None,
+    ) -> None:
         self.user = user
+        self.url = url
+        self.organizations = organizations
+        self.token_information = token_information
 
 
 class PluginInfo:
@@ -70,13 +92,15 @@ class PluginInfo:
     install_time: Optional[datetime]
     version: Optional[str]
 
-    def __init__(self,
-                 name: str,
-                 kind: str,
-                 size: int,
-                 last_used_time: datetime,
-                 install_time: Optional[datetime] = None,
-                 version: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        kind: str,
+        size: int,
+        last_used_time: datetime,
+        install_time: Optional[datetime] = None,
+        version: Optional[str] = None,
+    ) -> None:
         self.name = name
         self.kind = kind
         self.size = size
@@ -89,7 +113,11 @@ class Deployment:
     version: Optional[int]
     deployment: Optional[Mapping[str, Any]]
 
-    def __init__(self, version: Optional[int] = None, deployment: Optional[Mapping[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        version: Optional[int] = None,
+        deployment: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         self.version = version
         self.deployment = deployment
 
@@ -118,7 +146,7 @@ class Workspace(ABC):
     secrets_provider: Optional[str]
     """
     The secrets provider to use for encryption and decryption of stack secrets.
-    See: https://www.pulumi.com/docs/intro/concepts/config/#available-encryption-providers
+    See: https://www.pulumi.com/docs/intro/concepts/secrets/#available-encryption-providers
     """
 
     program: Optional[PulumiFn]
@@ -135,6 +163,11 @@ class Workspace(ABC):
     pulumi_version: str
     """
     The version of the underlying Pulumi CLI/Engine.
+    """
+
+    pulumi_command: PulumiCommand
+    """
+    The underlying PulumiCommand instance that is used to execute CLI commands.
     """
 
     @abstractmethod
@@ -193,13 +226,46 @@ class Workspace(ABC):
         """
 
     @abstractmethod
-    def get_config(self, stack_name: str, key: str) -> ConfigValue:
+    def add_environments(self, stack_name: str, *environment_names: str) -> None:
+        """
+        Adds environments to the end of a stack's import list. Imported environments are merged in order
+        per the ESC merge rules. The list of environments behaves as if it were the import list in an anonymous
+        environment.
+
+
+        :param stack_name: The name of the stack.
+        :param environment_names: The names of the environment to add.
+        """
+
+    @abstractmethod
+    def list_environments(self, stack_name: str) -> List[str]:
+        """
+        Returns the list of environments specified in a stack's configuration.
+
+        :param stack_name: The name of the stack.
+        :returns: List[str]
+        """
+
+    @abstractmethod
+    def remove_environment(self, stack_name: str, environment_name: str) -> None:
+        """
+        Removes the specified environment from the stack configuration.
+
+        :param stack_name: The name of the stack.
+        :param environment_name: The name of the environment to remove.
+        """
+
+    @abstractmethod
+    def get_config(
+        self, stack_name: str, key: str, *, path: bool = False
+    ) -> ConfigValue:
         """
         Returns the value associated with the specified stack name and key,
         scoped to the Workspace.
 
         :param stack_name: The name of the stack.
         :param key: The key for the config item to get.
+        :param path: The key contains a path to a property in a map or list to get.
         :returns: ConfigValue
         """
 
@@ -213,40 +279,50 @@ class Workspace(ABC):
         """
 
     @abstractmethod
-    def set_config(self, stack_name: str, key: str, value: ConfigValue) -> None:
+    def set_config(
+        self, stack_name: str, key: str, value: ConfigValue, *, path: bool = False
+    ) -> None:
         """
         Sets the specified key-value pair on the provided stack name.
 
         :param stack_name: The name of the stack.
         :param key: The config key to add.
         :param value: The config value to add.
+        :param path: The key contains a path to a property in a map or list to set.
         """
 
     @abstractmethod
-    def set_all_config(self, stack_name: str, config: ConfigMap) -> None:
+    def set_all_config(
+        self, stack_name: str, config: ConfigMap, *, path: bool = False
+    ) -> None:
         """
         Sets all values in the provided config map for the specified stack name.
 
         :param stack_name: The name of the stack.
         :param config: A mapping of key to ConfigValue to set to config.
+        :param path: The keys contain a path to a property in a map or list to set.
         """
 
     @abstractmethod
-    def remove_config(self, stack_name: str, key: str) -> None:
+    def remove_config(self, stack_name: str, key: str, *, path: bool = False) -> None:
         """
         Removes the specified key-value pair on the provided stack name.
 
         :param stack_name: The name of the stack.
         :param key: The key to remove from config.
+        :param path: The key contains a path to a property in a map or list to remove.
         """
 
     @abstractmethod
-    def remove_all_config(self, stack_name: str, keys: List[str]) -> None:
+    def remove_all_config(
+        self, stack_name: str, keys: List[str], *, path: bool = False
+    ) -> None:
         """
         Removes all values in the provided key list for the specified stack name.
 
         :param stack_name: The name of the stack.
         :param keys: The keys to remove from config.
+        :param path: The keys contain a path to a property in a map or list to remove.
         """
 
     @abstractmethod
@@ -255,6 +331,45 @@ class Workspace(ABC):
         Gets and sets the config map used with the last update for Stack matching stack name.
 
         :param stack_name: The name of the stack.
+        """
+
+    @abstractmethod
+    def get_tag(self, stack_name: str, key: str) -> str:
+        """
+        Returns the value associated with the specified stack name and key,
+        scoped to the Workspace.
+
+        :param stack_name: The name of the stack.
+        :param key: The key to use for the tag lookup.
+        :returns: str
+        """
+
+    @abstractmethod
+    def set_tag(self, stack_name: str, key: str, value: str) -> None:
+        """
+        Sets the specified key-value pair on the provided stack name.
+
+        :param stack_name: The name of the stack.
+        :param key: The tag key to set.
+        :param value: The tag value to set.
+        """
+
+    @abstractmethod
+    def remove_tag(self, stack_name: str, key: str) -> None:
+        """
+        Removes the specified key-value pair on the provided stack name.
+
+        :param stack_name: The name of the stack.
+        :param key: The tag key to remove.
+        """
+
+    @abstractmethod
+    def list_tags(self, stack_name: str) -> TagMap:
+        """
+        Returns the tag map for the specified tag name, scoped to the Workspace.
+
+        :param stack_name: The name of the stack.
+        :returns: TagMap
         """
 
     @abstractmethod
@@ -294,7 +409,12 @@ class Workspace(ABC):
         """
 
     @abstractmethod
-    def remove_stack(self, stack_name: str) -> None:
+    def remove_stack(
+        self,
+        stack_name: str,
+        force: Optional[bool] = None,
+        preserve_config: Optional[bool] = None,
+    ) -> None:
         """
         Deletes the stack and all associated configuration and history.
 
@@ -302,12 +422,13 @@ class Workspace(ABC):
         """
 
     @abstractmethod
-    def list_stacks(self) -> List[StackSummary]:
+    def list_stacks(self, include_all: Optional[bool] = None) -> List[StackSummary]:
         """
         Returns all Stacks created under the current Project.
         This queries underlying backend and may return stacks not present in the Workspace
         (as Pulumi.<stack>.yaml files).
 
+        :param include_all: List all stacks instead of just stacks for the current project
         :returns: List[StackSummary]
         """
 
@@ -322,10 +443,22 @@ class Workspace(ABC):
         """
 
     @abstractmethod
-    def remove_plugin(self,
-                      name: Optional[str] = None,
-                      version_range: Optional[str] = None,
-                      kind: str = "resource") -> None:
+    def install_plugin_from_server(self, name: str, version: str, server: str) -> None:
+        """
+        Installs a plugin in the Workspace from a remote server, for example a third party plugin.
+
+        :param name: The name of the plugin to install.
+        :param version: The version to install.
+        :param server: The server to install from.
+        """
+
+    @abstractmethod
+    def remove_plugin(
+        self,
+        name: Optional[str] = None,
+        version_range: Optional[str] = None,
+        kind: str = "resource",
+    ) -> None:
         """
         Removes a plugin from the Workspace matching the specified name and version.
 

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build python all
+//go:build python || all
 
 package workspace
 
@@ -21,6 +21,7 @@ import (
 )
 
 func TestPythonInstall(t *testing.T) {
+	t.Parallel()
 	testPluginInstall(t, "venv", map[string][]byte{
 		"PulumiPlugin.yaml": []byte("runtime: python\n"),
 		"package.json":      []byte("pulumi==2.0.0\n"),

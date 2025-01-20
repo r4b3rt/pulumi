@@ -1,89 +1,69 @@
+// Copyright 2020-2024, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package python
 
 import (
-	"bytes"
-	"io/ioutil"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 
-	"github.com/hashicorp/hcl/v2"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/model"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/pcl"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
-	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2"
-	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/syntax"
-	"github.com/pulumi/pulumi/pkg/v3/codegen/internal/test"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/testing/test"
 )
 
-var testdataPath = filepath.Join("..", "internal", "test", "testdata")
+func TestFunctionInvokeBindsArgumentObjectType(t *testing.T) {
+	t.Parallel()
 
-func TestGenProgram(t *testing.T) {
-	files, err := ioutil.ReadDir(testdataPath)
-	if err != nil {
-		t.Fatalf("could not read test data: %v", err)
-	}
+	const source = `zones = invoke("aws:index:getAvailabilityZones", {})`
 
-	for _, f := range files {
-		if filepath.Ext(f.Name()) != ".pp" {
-			continue
+	program, diags := parseAndBindProgram(t, source, "bind_func_invoke_args.pp")
+	contract.Ignore(diags)
+
+	g, err := newGenerator(program)
+	assert.NoError(t, err)
+
+	for _, n := range g.program.Nodes {
+		if zones, ok := n.(*pcl.LocalVariable); ok && zones.Name() == "zones" {
+			value := zones.Definition.Value
+			funcCall, ok := value.(*model.FunctionCallExpression)
+			assert.True(t, ok, "value of local variable is a function call")
+			assert.Equal(t, "invoke", funcCall.Name)
+			argsObject, ok := funcCall.Args[1].(*model.ObjectConsExpression)
+			assert.True(t, ok, "second argument is an object expression")
+			argsObjectType, ok := argsObject.Type().(*model.ObjectType)
+			assert.True(t, ok, "args object has an object type")
+			assert.NotEmptyf(t, argsObjectType.Annotations, "Object type should be annotated with a schema type")
+			break
 		}
-
-		expectNYIDiags := false
-		if filepath.Base(f.Name()) == "aws-s3-folder.pp" {
-			expectNYIDiags = true
-		}
-
-		t.Run(f.Name(), func(t *testing.T) {
-			path := filepath.Join(testdataPath, f.Name())
-			contents, err := ioutil.ReadFile(path)
-			if err != nil {
-				t.Fatalf("could not read %v: %v", path, err)
-			}
-			expected, err := ioutil.ReadFile(path + ".py")
-			if err != nil {
-				t.Fatalf("could not read %v: %v", path+".py", err)
-			}
-
-			parser := syntax.NewParser()
-			err = parser.ParseFile(bytes.NewReader(contents), f.Name())
-			if err != nil {
-				t.Fatalf("could not read %v: %v", path, err)
-			}
-			if parser.Diagnostics.HasErrors() {
-				t.Fatalf("failed to parse files: %v", parser.Diagnostics)
-			}
-
-			program, diags, err := hcl2.BindProgram(parser.Files, hcl2.PluginHost(test.NewHost(testdataPath)))
-			if err != nil {
-				t.Fatalf("could not bind program: %v", err)
-			}
-			if diags.HasErrors() {
-				t.Fatalf("failed to bind program: %v", diags)
-			}
-
-			files, diags, err := GenerateProgram(program)
-			assert.NoError(t, err)
-			if expectNYIDiags {
-				var tmpDiags hcl.Diagnostics
-				for _, d := range diags {
-					if !strings.HasPrefix(d.Summary, "not yet implemented") {
-						tmpDiags = append(tmpDiags, d)
-					}
-				}
-				diags = tmpDiags
-			}
-			if diags.HasErrors() {
-				t.Fatalf("failed to generate program: %v", diags)
-			}
-
-			if os.Getenv("PULUMI_ACCEPT") != "" {
-				err := ioutil.WriteFile(path+".py", files["__main__.py"], 0600)
-				require.NoError(t, err)
-			}
-
-			assert.Equal(t, string(expected), string(files["__main__.py"]))
-		})
 	}
+}
+
+func TestGenerateProgramVersionSelection(t *testing.T) {
+	t.Parallel()
+
+	test.GeneratePythonProgramTest(
+		t,
+		GenerateProgram,
+		func(
+			directory string, project workspace.Project,
+			program *pcl.Program, localDependencies map[string]string,
+		) error {
+			return GenerateProject(directory, project, program, localDependencies, "")
+		},
+	)
 }

@@ -1,17 +1,25 @@
-// Copyright 2016-2018, Pulumi Corporation.  All rights reserved.
+// Copyright 2016-2022, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package examples
 
 import (
 	"bytes"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/blang/semver"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/providers"
@@ -20,6 +28,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 )
 
+//nolint:paralleltest // uses parallel programtest
 func TestAccMinimal(t *testing.T) {
 	test := getBaseOptions().
 		With(integration.ProgramTestOptions{
@@ -40,27 +49,7 @@ func TestAccMinimal(t *testing.T) {
 	integration.ProgramTest(t, &test)
 }
 
-func TestAccMinimal_withLocalState(t *testing.T) {
-	test := getBaseOptions().
-		With(integration.ProgramTestOptions{
-			Dir: filepath.Join(getCwd(t), "minimal"),
-			Config: map[string]string{
-				"name": "Pulumi",
-			},
-			Secrets: map[string]string{
-				"secret": "this is my secret message",
-			},
-			ExtraRuntimeValidation: func(t *testing.T, stackInfo integration.RuntimeValidationStackInfo) {
-				// Simple runtime validation that just ensures the checkpoint was written and read.
-				assert.NotNil(t, stackInfo.Deployment)
-			},
-			RunBuild: true,
-			CloudURL: "file://~",
-		})
-
-	integration.ProgramTest(t, &test)
-}
-
+//nolint:paralleltest // uses parallel programtest
 func TestAccDynamicProviderSimple(t *testing.T) {
 	test := getBaseOptions().
 		With(integration.ProgramTestOptions{
@@ -75,21 +64,7 @@ func TestAccDynamicProviderSimple(t *testing.T) {
 	integration.ProgramTest(t, &test)
 }
 
-func TestAccDynamicProviderSimple_withLocalState(t *testing.T) {
-	test := getBaseOptions().
-		With(integration.ProgramTestOptions{
-			Dir: filepath.Join(getCwd(t), "dynamic-provider/simple"),
-			Config: map[string]string{
-				"simple:config:w": "1",
-				"simple:config:x": "1",
-				"simple:config:y": "1",
-			},
-			CloudURL: "file://~",
-		})
-
-	integration.ProgramTest(t, &test)
-}
-
+//nolint:paralleltest // uses parallel programtest
 func TestAccDynamicProviderClassWithComments(t *testing.T) {
 	test := getBaseOptions().
 		With(integration.ProgramTestOptions{
@@ -99,16 +74,18 @@ func TestAccDynamicProviderClassWithComments(t *testing.T) {
 	integration.ProgramTest(t, &test)
 }
 
+//nolint:paralleltest // uses parallel programtest
 func TestAccDynamicProviderClassWithComments_withLocalState(t *testing.T) {
 	test := getBaseOptions().
 		With(integration.ProgramTestOptions{
 			Dir:      filepath.Join(getCwd(t), "dynamic-provider/class-with-comments"),
-			CloudURL: "file://~",
+			CloudURL: integration.MakeTempBackend(t),
 		})
 
 	integration.ProgramTest(t, &test)
 }
 
+//nolint:paralleltest // uses parallel programtest
 func TestAccDynamicProviderMultipleTurns(t *testing.T) {
 	test := getBaseOptions().
 		With(integration.ProgramTestOptions{
@@ -126,6 +103,7 @@ func TestAccDynamicProviderMultipleTurns(t *testing.T) {
 	integration.ProgramTest(t, &test)
 }
 
+//nolint:paralleltest // uses parallel programtest
 func TestAccDynamicProviderMultipleTurns_withLocalState(t *testing.T) {
 	test := getBaseOptions().
 		With(integration.ProgramTestOptions{
@@ -138,12 +116,13 @@ func TestAccDynamicProviderMultipleTurns_withLocalState(t *testing.T) {
 					}
 				}
 			},
-			CloudURL: "file://~",
+			CloudURL: integration.MakeTempBackend(t),
 		})
 
 	integration.ProgramTest(t, &test)
 }
 
+//nolint:paralleltest // uses parallel programtest
 func TestAccDynamicProviderMultipleTurns2(t *testing.T) {
 	test := getBaseOptions().
 		With(integration.ProgramTestOptions{
@@ -153,16 +132,47 @@ func TestAccDynamicProviderMultipleTurns2(t *testing.T) {
 	integration.ProgramTest(t, &test)
 }
 
+//nolint:paralleltest // uses parallel programtest
 func TestAccDynamicProviderMultipleTurns2_withLocalState(t *testing.T) {
 	test := getBaseOptions().
 		With(integration.ProgramTestOptions{
 			Dir:      filepath.Join(getCwd(t), "dynamic-provider/multiple-turns-2"),
-			CloudURL: "file://~",
+			CloudURL: integration.MakeTempBackend(t),
 		})
 
 	integration.ProgramTest(t, &test)
 }
 
+//nolint:paralleltest // uses parallel programtest
+func TestAccDynamicProviderSecrets(t *testing.T) {
+	test := getBaseOptions().
+		With(integration.ProgramTestOptions{
+			Dir: filepath.Join(getCwd(t), "dynamic-provider/secrets"),
+			Secrets: map[string]string{
+				"password": "s3cret",
+			},
+			ExtraRuntimeValidation: func(t *testing.T, stackInfo integration.RuntimeValidationStackInfo) {
+				// Ensure the __provider input (and corresponding output) was marked secret
+				dynRes := stackInfo.Deployment.Resources[2]
+				for _, providerVal := range []interface{}{dynRes.Inputs["__provider"], dynRes.Outputs["__provider"]} {
+					switch v := providerVal.(type) {
+					case string:
+						assert.Fail(t, "__provider was not a secret")
+					case map[string]interface{}:
+						assert.Equal(t, resource.SecretSig, v[resource.SigKey])
+					}
+				}
+				// Ensure the resulting output had the expected value
+				code, ok := stackInfo.Outputs["out"].(string)
+				assert.True(t, ok)
+				assert.Equal(t, "200", code)
+			},
+		})
+
+	integration.ProgramTest(t, &test)
+}
+
+//nolint:paralleltest // uses parallel programtest
 func TestAccDynamicProviderDerivedInputs(t *testing.T) {
 	test := getBaseOptions().
 		With(integration.ProgramTestOptions{
@@ -172,16 +182,28 @@ func TestAccDynamicProviderDerivedInputs(t *testing.T) {
 	integration.ProgramTest(t, &test)
 }
 
-func TestAccDynamicProviderDerivedInputs_withLocalState(t *testing.T) {
+//nolint:paralleltest // uses parallel programtest
+func TestDynamicProviderGenericTypes(t *testing.T) {
 	test := getBaseOptions().
 		With(integration.ProgramTestOptions{
-			Dir:      filepath.Join(getCwd(t), "dynamic-provider/derived-inputs"),
-			CloudURL: "file://~",
+			Dir: filepath.Join(getCwd(t), "dynamic-provider/generic-types"),
 		})
 
 	integration.ProgramTest(t, &test)
 }
 
+//nolint:paralleltest // uses parallel programtest
+func TestAccDynamicProviderDerivedInputs_withLocalState(t *testing.T) {
+	test := getBaseOptions().
+		With(integration.ProgramTestOptions{
+			Dir:      filepath.Join(getCwd(t), "dynamic-provider/derived-inputs"),
+			CloudURL: integration.MakeTempBackend(t),
+		})
+
+	integration.ProgramTest(t, &test)
+}
+
+//nolint:paralleltest // uses parallel programtest
 func TestAccFormattable(t *testing.T) {
 	var formattableStdout, formattableStderr bytes.Buffer
 	test := getBaseOptions().
@@ -199,24 +221,7 @@ func TestAccFormattable(t *testing.T) {
 	integration.ProgramTest(t, &test)
 }
 
-func TestAccFormattable_withLocalState(t *testing.T) {
-	var formattableStdout, formattableStderr bytes.Buffer
-	test := getBaseOptions().
-		With(integration.ProgramTestOptions{
-			Dir: filepath.Join(getCwd(t), "formattable"),
-			ExtraRuntimeValidation: func(t *testing.T, stackInfo integration.RuntimeValidationStackInfo) {
-				// Note that we're abusing this hook to validate stdout. We don't actually care about the checkpoint.
-				stdout := formattableStdout.String()
-				assert.False(t, strings.Contains(stdout, "MISSING"))
-			},
-			Stdout:   &formattableStdout,
-			Stderr:   &formattableStderr,
-			CloudURL: "file://~",
-		})
-
-	integration.ProgramTest(t, &test)
-}
-
+//nolint:paralleltest // uses parallel programtest
 func TestAccSecrets(t *testing.T) {
 	test := getBaseOptions().
 		With(integration.ProgramTestOptions{
@@ -227,6 +232,7 @@ func TestAccSecrets(t *testing.T) {
 			Secrets: map[string]string{
 				"apiKey": "FAKE_API_KEY_FOR_TESTING",
 			},
+			Quick: true,
 			ExtraRuntimeValidation: func(t *testing.T, stackInfo integration.RuntimeValidationStackInfo) {
 				assert.NotNil(t, stackInfo.Deployment.SecretsProviders, "Deployment should have a secrets provider")
 
@@ -304,62 +310,4 @@ func TestAccSecrets(t *testing.T) {
 		})
 
 	integration.ProgramTest(t, &test)
-}
-
-func TestAccNodeCompatTests(t *testing.T) {
-	skipIfNotNode610(t)
-	test := getBaseOptions().
-		With(integration.ProgramTestOptions{
-			Dir: filepath.Join(getCwd(t), "compat/v0.10.0/minimal"),
-			Config: map[string]string{
-				"name": "Pulumi",
-			},
-			Secrets: map[string]string{
-				"secret": "this is my secret message",
-			},
-			RunBuild: true,
-		})
-
-	integration.ProgramTest(t, &test)
-}
-
-func getCwd(t *testing.T) string {
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.FailNow()
-	}
-	return cwd
-}
-
-func getBaseOptions() integration.ProgramTestOptions {
-	return integration.ProgramTestOptions{
-		Dependencies: []string{"@pulumi/pulumi"},
-	}
-}
-
-func getPythonBaseOptions() integration.ProgramTestOptions {
-	return integration.ProgramTestOptions{
-		Dependencies: []string{
-			filepath.Join("..", "sdk", "python", "env", "src"),
-		},
-	}
-}
-
-func skipIfNotNode610(t *testing.T) {
-	nodeVer, err := getNodeVersion()
-	if err != nil && nodeVer.Major == 6 && nodeVer.Minor == 10 {
-		t.Skip("Skipping 0.10.0 compat tests, because current node version is not 6.10.X")
-	}
-}
-
-func getNodeVersion() (semver.Version, error) {
-	var buf bytes.Buffer
-
-	nodeVersionCmd := exec.Command("node", "--version")
-	nodeVersionCmd.Stdout = &buf
-	if err := nodeVersionCmd.Run(); err != nil {
-		return semver.Version{}, errors.Wrap(err, "running node --version")
-	}
-
-	return semver.ParseTolerant(buf.String())
 }

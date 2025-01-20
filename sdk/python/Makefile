@@ -1,34 +1,47 @@
 PROJECT_NAME     := Pulumi Python SDK
-LANGHOST_PKG     := github.com/pulumi/pulumi/sdk/v3/python/cmd/pulumi-language-python
-VERSION          := $(shell cd ../../ && pulumictl get version)
-PYPI_VERSION 	 := $(shell cd ../../ && pulumictl get version --language python)
+LANGHOST_PKG     := github.com/pulumi/pulumi/sdk/python/cmd/pulumi-language-python/v3
+VERSION          := $(if ${PULUMI_VERSION},${PULUMI_VERSION},$(shell ../../scripts/pulumi-version.sh))
+PYPI_VERSION 	   := $(if ${PYPI_VERSION},${PYPI_VERSION},$(shell ../../scripts/pulumi-version.sh python))
 
-PYENV := ./env
-PYENVSRC := $(PYENV)/src
+ifeq ($(DEBUG),"true")
+$(info    VERSION       = $(VERSION))
+$(info    PYPI_VERSION  = $(PYPI_VERSION))
+endif
 
-PROJECT_PKGS    := $(shell go list ./cmd/...)
-TESTPARALLELISM := 10
+PROJECT_PKGS    := $(shell go list -C cmd/pulumi-language-python ./...)
 
 include ../../build/common.mk
 
-ensure::
-	pipenv install --dev
-	mkdir -p $(PYENVSRC)
+# Motivation: running `make TEST_ALL_DEPS= test_all` permits running
+# `test_all` without the dependencies.
+TEST_ALL_DEPS ?= build
 
-build_package::
-	rm -rf $(PYENVSRC) && cp -R ./lib/. $(PYENVSRC)/
-	sed -i.bak "s/\$${VERSION}/$(PYPI_VERSION)/g" $(PYENVSRC)/setup.py && rm $(PYENVSRC)/setup.py.bak
-	cp ../../README.md $(PYENVSRC)
-	cd $(PYENVSRC) && pipenv run python setup.py build bdist_wheel --universal
+ensure::
+	@command -v uv > /dev/null || { echo "uv command not found. Please install it first." && exit 1; }
+	uv venv --allow-existing
+	uv sync --dev
+
+build_package:: ensure
+	uv run -m build --outdir ./build --installer uv
 
 build_plugin::
-	go install -ldflags "-X github.com/pulumi/pulumi/sdk/v3/go/common/version.Version=${VERSION}" ${LANGHOST_PKG}
+	go install -C cmd/pulumi-language-python \
+		-ldflags "-X github.com/pulumi/pulumi/sdk/v3/go/common/version.Version=${VERSION}" ${LANGHOST_PKG}
 
 build:: build_package build_plugin
 
-lint::
-	MYPYPATH=./stubs pipenv run mypy ./lib/pulumi --config-file=mypy.ini
-	pipenv run pylint ./lib/pulumi --rcfile=.pylintrc
+lint:: ensure
+	uv run -m ruff format --check
+	MYPYPATH=./stubs uv run -m mypy ./lib/pulumi
+	uv run -m ruff check
+	uv run -m pyright
+
+lint_fix:: ensure
+	make format
+	make lint
+
+format:: ensure
+	uv run -m ruff format
 
 install_package:: build_package
 	cp ./cmd/pulumi-language-python-exec "$(PULUMI_BIN)"
@@ -36,38 +49,45 @@ install_package:: build_package
 	cp ./dist/pulumi-analyzer-policy-python "$(PULUMI_BIN)"
 
 install_plugin:: build_plugin
-	GOBIN=$(PULUMI_BIN) go install \
+	GOBIN=$(PULUMI_BIN) go install -C cmd/pulumi-language-python \
 		  -ldflags "-X github.com/pulumi/pulumi/sdk/v3/go/common/version.Version=${VERSION}" ${LANGHOST_PKG}
 
 install:: install_package install_plugin
 
-test_fast:: build
-	go test -count=1 -cover -parallel ${TESTPARALLELISM} ${PROJECT_PKGS}
-	pipenv run pip install ./env/src
-	# TODO the ignored test seems to fail in pytest but not unittest. Need to trackdown why
-	pipenv run pytest lib/test --ignore lib/test/langhost/resource_thens/test_resource_thens.py
-	pipenv run python -m unittest lib/test/langhost/resource_thens/test_resource_thens.py
-	# Using python -m also adds lib/test_with_mocks to sys.path which avoids package resolution issues.
-	pushd lib/test_with_mocks ; pipenv run python -m pytest ; popd
+test_go:: $(TEST_ALL_DEPS)
+	@cd cmd/pulumi-language-python && \
+		$(GO_TEST) ${PROJECT_PKGS}
 
-test_all:: test_fast
+test_fast:: $(TEST_ALL_DEPS)
+	. .venv/*/activate && ./scripts/test_fast.sh
+
+test_auto:: $(TEST_ALL_DEPS)
+	. .venv/*/activate && ./scripts/test_auto.sh
+
+test_all:: test_fast test_auto test_go
 
 dist::
-	go install -ldflags "-X github.com/pulumi/pulumi/sdk/v3/go/common/version.Version=${VERSION}" ${LANGHOST_PKG}
+	go install -C cmd/pulumi-language-python \
+		-ldflags "-X github.com/pulumi/pulumi/sdk/v3/go/common/version.Version=${VERSION}" ${LANGHOST_PKG}
 	cp ./cmd/pulumi-language-python-exec "$$(go env GOPATH)"/bin/
 	cp ./dist/pulumi-resource-pulumi-python "$$(go env GOPATH)"/bin/
 	cp ./dist/pulumi-analyzer-policy-python "$$(go env GOPATH)"/bin/
 
 brew:: BREW_VERSION := $(shell ../../scripts/get-version HEAD)
 brew::
-	go install -ldflags "-X github.com/pulumi/pulumi/sdk/v3/go/common/version.Version=${BREW_VERSION}" ${LANGHOST_PKG}
+	go install -C cmd/pulumi-language-python \
+		-ldflags "-X github.com/pulumi/pulumi/sdk/v3/go/common/version.Version=${BREW_VERSION}" ${LANGHOST_PKG}
 	cp ./cmd/pulumi-language-python-exec "$$(go env GOPATH)"/bin/
 	cp ./dist/pulumi-resource-pulumi-python "$$(go env GOPATH)"/bin/
 	cp ./dist/pulumi-analyzer-policy-python "$$(go env GOPATH)"/bin/
 
-publish:: build_package
-	twine upload \
-    	-u pulumi -p "${PYPI_PASSWORD}" \
-        "env/src/dist"/*.whl \
-        --skip-existing \
-        --verbose
+publish:: ensure
+	for file in ../../artifacts/sdk-python-*.whl; do \
+		basename=$$(basename $${file}); \
+		mv -vT "$${file}" "../../artifacts/$${basename##sdk-python-}"; \
+	done
+	uv run twine upload \
+	-u "${PYPI_USERNAME}" -p "${PYPI_PASSWORD}" \
+		../../artifacts/*.whl \
+		--skip-existing \
+		--verbose

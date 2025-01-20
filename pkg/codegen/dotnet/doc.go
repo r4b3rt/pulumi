@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// nolint: lll
+//nolint:lll
 package dotnet
 
 import (
@@ -73,12 +73,17 @@ func (d DocLanguageHelper) GetDocLinkForFunctionInputOrOutputType(pkg *schema.Pa
 
 // GetLanguageTypeString returns the DotNet-specific type given a Pulumi schema type.
 func (d DocLanguageHelper) GetLanguageTypeString(pkg *schema.Package, moduleName string, t schema.Type, input bool) string {
+	info, ok := pkg.Language["csharp"].(CSharpPackageInfo)
+	if !ok {
+		info = CSharpPackageInfo{}
+	}
 	typeDetails := map[*schema.ObjectType]*typeDetails{}
 	mod := &modContext{
-		pkg:         pkg,
-		mod:         moduleName,
-		typeDetails: typeDetails,
-		namespaces:  d.Namespaces,
+		pkg:           pkg.Reference(),
+		mod:           moduleName,
+		typeDetails:   typeDetails,
+		namespaces:    d.Namespaces,
+		rootNamespace: info.GetRootNamespace(),
 	}
 	qualifier := "Inputs"
 	if !input {
@@ -96,6 +101,45 @@ func (d DocLanguageHelper) GetFunctionName(modName string, f *schema.Function) s
 func (d DocLanguageHelper) GetResourceFunctionResultName(modName string, f *schema.Function) string {
 	funcName := d.GetFunctionName(modName, f)
 	return funcName + "Result"
+}
+
+func (d DocLanguageHelper) GetMethodName(m *schema.Method) string {
+	return Title(m.Name)
+}
+
+func (d DocLanguageHelper) GetMethodResultName(pkg *schema.Package, modName string, r *schema.Resource,
+	m *schema.Method,
+) string {
+	var returnType *schema.ObjectType
+	if m.Function.ReturnType != nil {
+		if objectType, ok := m.Function.ReturnType.(*schema.ObjectType); ok {
+			returnType = objectType
+		} else {
+			typeDetails := map[*schema.ObjectType]*typeDetails{}
+			mod := &modContext{
+				pkg:         pkg.Reference(),
+				mod:         modName,
+				typeDetails: typeDetails,
+				namespaces:  d.Namespaces,
+			}
+			return mod.typeString(m.Function.ReturnType, "", false, false, false)
+		}
+	}
+
+	if info, ok := pkg.Language["csharp"].(CSharpPackageInfo); ok {
+		if info.LiftSingleValueMethodReturns && returnType != nil && len(returnType.Properties) == 1 {
+			typeDetails := map[*schema.ObjectType]*typeDetails{}
+			mod := &modContext{
+				pkg:           pkg.Reference(),
+				mod:           modName,
+				typeDetails:   typeDetails,
+				namespaces:    d.Namespaces,
+				rootNamespace: info.GetRootNamespace(),
+			}
+			return mod.typeString(returnType.Properties[0].Type, "", false, false, false)
+		}
+	}
+	return fmt.Sprintf("%s.%sResult", resourceName(r), d.GetMethodName(m))
 }
 
 // GetPropertyName uses the property's csharp-specific language info, if available, to generate
@@ -134,7 +178,7 @@ func (d DocLanguageHelper) GetModuleDocLink(pkg *schema.Package, modName string)
 	var displayName string
 	var link string
 	if modName == "" {
-		displayName = fmt.Sprintf("Pulumi.%s", namespaceName(d.Namespaces, pkg.Name))
+		displayName = "Pulumi." + namespaceName(d.Namespaces, pkg.Name)
 	} else {
 		displayName = fmt.Sprintf("Pulumi.%s.%s", namespaceName(d.Namespaces, pkg.Name), modName)
 	}

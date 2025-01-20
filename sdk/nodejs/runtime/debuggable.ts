@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2022, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,37 +13,42 @@
 // limitations under the License.
 
 import * as log from "../log";
+import * as state from "./state";
 
 /**
  * debugPromiseLeaks can be set to enable promises leaks debugging.
+ *
+ * @internal
  */
-const debugPromiseLeaks: boolean = !!process.env.PULUMI_DEBUG_PROMISE_LEAKS;
+export const debugPromiseLeaks: boolean = !!process.env.PULUMI_DEBUG_PROMISE_LEAKS;
 
 /**
- * leakDetectorScheduled is true when the promise leak detector is scheduled for process exit.
+ * leakDetectorScheduled is true when the promise leak detector is scheduled for
+ * process exit.
  */
 let leakDetectorScheduled: boolean = false;
 
 /**
- * leakCandidates tracks the list of potential leak candidates.
+ * @internal
  */
-let leakCandidates: Set<Promise<any>> = new Set<Promise<any>>();
-
 export function leakedPromises(): [Set<Promise<any>>, string] {
-    const leaked = leakCandidates;
-    const promisePlural = leaked.size === 0 ? "promise was" : "promises were";
-    const message = leaked.size === 0 ? "" :
-        `The Pulumi runtime detected that ${leaked.size} ${promisePlural} still active\n` +
-        "at the time that the process exited. There are a few ways that this can occur:\n" +
-        "  * Not using `await` or `.then` on a Promise returned from a Pulumi API\n" +
-        "  * Introducing a cyclic dependency between two Pulumi Resources\n" +
-        "  * A bug in the Pulumi Runtime\n" +
-        "\n" +
-        "Leaving promises active is probably not what you want. If you are unsure about\n" +
-        "why you are seeing this message, re-run your program "
-            + "with the `PULUMI_DEBUG_PROMISE_LEAKS`\n" +
-        "environment variable. The Pulumi runtime will then print out additional\n" +
-        "debug information about the leaked promises.";
+    const localStore = state.getStore();
+    const leaked = localStore.leakCandidates;
+    const promisePlural = leaked.size === 1 ? "promise was" : "promises were";
+    const message =
+        leaked.size === 0
+            ? ""
+            : `The Pulumi runtime detected that ${leaked.size} ${promisePlural} still active\n` +
+              "at the time that the process exited. There are a few ways that this can occur:\n" +
+              "  * Not using `await` or `.then` on a Promise returned from a Pulumi API\n" +
+              "  * Introducing a cyclic dependency between two Pulumi Resources\n" +
+              "  * A bug in the Pulumi Runtime\n" +
+              "\n" +
+              "Leaving promises active is probably not what you want. If you are unsure about\n" +
+              "why you are seeing this message, re-run your program " +
+              "with the `PULUMI_DEBUG_PROMISE_LEAKS`\n" +
+              "environment variable. The Pulumi runtime will then print out additional\n" +
+              "debug information about the leaked promises.";
 
     if (debugPromiseLeaks) {
         for (const leak of leaked) {
@@ -52,23 +57,27 @@ export function leakedPromises(): [Set<Promise<any>>, string] {
         }
     }
 
-    leakCandidates = new Set<Promise<any>>();
+    localStore.leakCandidates = new Set();
     return [leaked, message];
 }
 
+/**
+ * @internal
+ */
 export function promiseDebugString(p: Promise<any>): string {
-    return `CONTEXT(${(<any>p)._debugId}): ${(<any>p)._debugCtx}\n` +
-        `STACK_TRACE:\n` +
-        `${(<any>p)._debugStackTrace}`;
+    return `CONTEXT(${(<any>p)._debugId}): ${(<any>p)._debugCtx}\n` + `STACK_TRACE:\n` + `${(<any>p)._debugStackTrace}`;
 }
 
 let promiseId = 0;
 
 /**
- * debuggablePromise optionally wraps a promise with some goo to make it easier to debug common problems.
+ * Optionally wraps a promise with some goo to make it easier to debug common
+ * problems.
+ *
  * @internal
  */
 export function debuggablePromise<T>(p: Promise<T>, ctx: any): Promise<T> {
+    const localStore = state.getStore();
     // Whack some stack onto the promise.  Leave them non-enumerable to avoid awkward rendering.
     Object.defineProperty(p, "_debugId", { writable: true, value: promiseId });
     Object.defineProperty(p, "_debugCtx", { writable: true, value: ctx });
@@ -103,19 +112,23 @@ export function debuggablePromise<T>(p: Promise<T>, ctx: any): Promise<T> {
     }
 
     // Add this promise to the leak candidates list, and schedule it for removal if it resolves.
-    leakCandidates.add(p);
-    return p.then((val: any) => {
-        leakCandidates.delete(p);
-        return val;
-    }).catch((err: any) => {
-        leakCandidates.delete(p);
-        err.promise = p;
-        throw err;
-    });
+    localStore.leakCandidates.add(p);
+    return p
+        .then((val: any) => {
+            localStore.leakCandidates.delete(p);
+            return val;
+        })
+        .catch((err: any) => {
+            localStore.leakCandidates.delete(p);
+            err.promise = p;
+            throw err;
+        });
 }
 
 /**
- * errorString produces a string from an error, conditionally including additional diagnostics.
+ * Produces a string from an error, conditionally including additional
+ * diagnostics.
+ *
  * @internal
  */
 export function errorString(err: Error): string {
@@ -124,4 +137,3 @@ export function errorString(err: Error): string {
     }
     return err.toString();
 }
-

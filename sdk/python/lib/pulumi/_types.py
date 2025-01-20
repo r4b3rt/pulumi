@@ -270,22 +270,39 @@ import collections.abc
 import functools
 import sys
 import typing
-from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Tuple, Type, TypeVar, Union, cast, get_type_hints
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    Mapping,
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+    cast,
+    get_type_hints,
+    overload,
+)
 
 from . import _utils
 
-T = TypeVar('T')
+T = TypeVar("T")
+C = TypeVar("C", bound=Callable)
 
 
 _PULUMI_NAME = "_pulumi_name"
 _PULUMI_INPUT_TYPE = "_pulumi_input_type"
 _PULUMI_OUTPUT_TYPE = "_pulumi_output_type"
 _PULUMI_PYTHON_TO_PULUMI_TABLE = "_pulumi_python_to_pulumi_table"
+_PULUMI_DEPRECATED_CALLABLE = "_pulumi_deprecated_callable"
 _TRANSLATE_PROPERTY = "_translate_property"
 
 
 def is_input_type(cls: type) -> bool:
     return hasattr(cls, _PULUMI_INPUT_TYPE)
+
 
 def is_output_type(cls: type) -> bool:
     return hasattr(cls, _PULUMI_OUTPUT_TYPE)
@@ -293,16 +310,20 @@ def is_output_type(cls: type) -> bool:
 
 class _MISSING_TYPE:
     pass
+
+
 MISSING = _MISSING_TYPE()
 """
 MISSING is a singleton sentinel object to detect if a parameter is supplied or not.
 """
+
 
 class _Property:
     """
     Represents a Pulumi property. It is not meant to be created outside this module,
     rather, the property() function should be used.
     """
+
     def __init__(self, name: str, default: Any = MISSING) -> None:
         if not name:
             raise TypeError("Missing name argument")
@@ -315,8 +336,7 @@ class _Property:
 
 # This function's return type is deliberately annotated as Any so that type checkers do not
 # complain about assignments that we want to allow like `my_value: str = property("myValue")`.
-# pylint: disable=redefined-builtin
-def property(name: str, *, default: Any = MISSING) -> Any:
+def property(name: str, *, default: Any = MISSING) -> Any:  # noqa: A001 shadowing builtin
     """
     Return an object to identify Pulumi properties.
 
@@ -332,21 +352,27 @@ def _properties_from_annotations(cls: type) -> Dict[str, _Property]:
 
     # Get annotations that are defined on this class (not base classes).
     # These are returned in the order declared on Python 3.6+.
-    cls_annotations = cls.__dict__.get('__annotations__', {})
+    cls_annotations = cls.__dict__.get("__annotations__", {})
 
     def get_property(cls: type, a_name: str, a_type: Any) -> _Property:
         default = getattr(cls, a_name, MISSING)
-        p = default if isinstance(default, _Property) else _Property(name=a_name, default=default)
+        p = (
+            default
+            if isinstance(default, _Property)
+            else _Property(name=a_name, default=default)
+        )
         p.type = a_type
         return p
 
     return {
         name: get_property(cls, name, type)
-        for name, type in cls_annotations.items()
+        for name, type in cls_annotations.items()  #  noqa: A001 shadowing builtin
     }
 
 
-def _process_class(cls: type, signifier_attr: str, is_input: bool = False, setter: bool = False):
+def _process_class(
+    cls: type, signifier_attr: str, is_input: bool = False, setter: bool = False
+):
     # Get properties.
     props = _properties_from_annotations(cls)
 
@@ -371,18 +397,29 @@ def _process_class(cls: type, signifier_attr: str, is_input: bool = False, sette
             globals = sys.modules[cls.__module__].__dict__
         else:
             globals = {}
-        init_fn = _init_fn(props, globals, issubclass(cls, dict), not is_input and hasattr(cls, _TRANSLATE_PROPERTY))
+        init_fn = _init_fn(
+            props,
+            globals,
+            issubclass(cls, dict),
+            not is_input and hasattr(cls, _TRANSLATE_PROPERTY),
+        )
         setattr(cls, "__init__", init_fn)
 
     # Add an __eq__() method if the class doesn't have one.
     # There's no need for a __ne__ method, since Python will call __eq__ and negate it.
     if "__eq__" not in cls.__dict__:
         if issubclass(cls, dict):
+
             def eq_fn(self, other):
-                return type(other) is type(self) and getattr(dict, "__eq__")(other, self)
+                return type(other) is type(self) and getattr(dict, "__eq__")(
+                    other, self
+                )
+
         else:
+
             def eq_fn(self, other):
                 return type(other) is type(self) and other.__dict__ == self.__dict__
+
         setattr(cls, "__eq__", eq_fn)
 
 
@@ -390,15 +427,19 @@ def _create_py_property(a_name: str, pulumi_name: str, typ: Any, setter: bool = 
     """
     Returns a Python property getter that looks up the value using get.
     """
+
     def getter_fn(self):
         return get(self, a_name)
+
     getter_fn.__name__ = a_name
     getter_fn.__annotations__ = {"return": typ}
     setattr(getter_fn, _PULUMI_NAME, pulumi_name)
 
     if setter:
+
         def setter_fn(self, value):
             return set(self, a_name, value)
+
         setter_fn.__name__ = a_name
         setter_fn.__annotations__ = {"value": typ}
         return builtins.property(fget=getter_fn, fset=setter_fn)
@@ -413,7 +454,8 @@ def _py_properties(cls: type) -> Iterator[Tuple[str, str, builtins.property]]:
                 prop = cast(builtins.property, v)
                 pulumi_name = getattr(prop.fget, _PULUMI_NAME, MISSING)
                 if pulumi_name is not MISSING:
-                    yield (python_name, pulumi_name, prop)
+                    yield (python_name, cast(str, pulumi_name), prop)
+
 
 def input_type(cls: Type[T]) -> Type[T]:
     """
@@ -421,7 +463,9 @@ def input_type(cls: Type[T]) -> Type[T]:
     """
 
     if is_input_type(cls) or is_output_type(cls):
-        raise AssertionError("Cannot apply @input_type and @output_type more than once.")
+        raise AssertionError(
+            "Cannot apply @input_type and @output_type more than once."
+        )
 
     # Get the input properties and mark the class as an input type.
     _process_class(cls, _PULUMI_INPUT_TYPE, is_input=True, setter=True)
@@ -430,6 +474,7 @@ def input_type(cls: Type[T]) -> Type[T]:
     def create_setter(name: str) -> Callable:
         def setter_fn(self, value):
             set(self, name, value)
+
         return setter_fn
 
     # Now, process the class's properties, replacing properties with empty setters with
@@ -450,7 +495,10 @@ def input_type_py_to_pulumi_names(input_type_cls: Type) -> Dict[str, str]:
     Returns a dict of Python names to Pulumi names for the input type.
     """
     assert is_input_type(input_type_cls)
-    return {python_name: pulumi_name for python_name, pulumi_name, _ in _py_properties(input_type_cls)}
+    return {
+        python_name: pulumi_name
+        for python_name, pulumi_name, _ in _py_properties(input_type_cls)
+    }
 
 
 def input_type_types(input_type_cls: type) -> Dict[str, type]:
@@ -473,7 +521,17 @@ def input_type_to_dict(obj: Any) -> Dict[str, Any]:
     # Build a dictionary of properties to return
     result: Dict[str, Any] = {}
     for _, pulumi_name, prop in _py_properties(cls):
-        value = prop.fget(obj)  # type: ignore
+        fget = prop.fget
+
+        # If the property has a _pulumi_deprecated_callable attribute, use that
+        # as the getter. We do this so as to bypass the warnings which would
+        # otherwise be emitted, which are not appropriate here since the user
+        # has not written code that makes use of a deprecated identifier.
+        deprecated_callable = prop.fget.__dict__.get(_PULUMI_DEPRECATED_CALLABLE)
+        if deprecated_callable is not None:
+            fget = deprecated_callable
+
+        value = fget(obj)  # type: ignore
         # We treat properties with a value of None as if they don't exist.
         if value is not None:
             result[pulumi_name] = value
@@ -502,7 +560,9 @@ def output_type(cls: Type[T]) -> Type[T]:
     """
 
     if is_input_type(cls) or is_output_type(cls):
-        raise AssertionError("Cannot apply @input_type and @output_type more than once.")
+        raise AssertionError(
+            "Cannot apply @input_type and @output_type more than once."
+        )
 
     # Get the output properties and mark the class as an output type.
     _process_class(cls, _PULUMI_OUTPUT_TYPE)
@@ -512,7 +572,6 @@ def output_type(cls: Type[T]) -> Type[T]:
     # the Python name to the Pulumi name, and then pass the Pulumi name to _translate_property() to
     # convert the Pulumi name to whatever name _translate_property() returns (which, for our
     # provider codegen, will be the translated name from _tables.CAMEL_TO_SNAKE_CASE_TABLE).
-    # pylint: disable=too-many-nested-blocks
     if hasattr(cls, _TRANSLATE_PROPERTY):
         python_to_pulumi_table = None
         for python_name, pulumi_name, _ in _py_properties(cls):
@@ -534,12 +593,17 @@ def output_type_from_dict(cls: Type[T], output: Dict[str, Any]) -> T:
     return cls(**args)  # type: ignore
 
 
+@overload
+def getter(*, name: Optional[str] = None) -> Callable[[C], C]: ...
+@overload
+def getter(_fn: C) -> C: ...
 def getter(_fn=None, *, name: Optional[str] = None):
     """
     Decorator to indicate a function is a Pulumi property getter.
 
     name is the Pulumi property name. If not set, the name of the function is used.
     """
+
     def decorator(fn: Callable) -> Callable:
         if not callable(fn):
             raise TypeError("Expected fn to be callable")
@@ -547,10 +611,12 @@ def getter(_fn=None, *, name: Optional[str] = None):
         # If name isn't specified, use the name of the function.
         pulumi_name = name if name is not None else fn.__name__
         if _utils.is_empty_function(fn):
+
             @functools.wraps(fn)
             def get_fn(self):
                 # Get the value using the Python name, which is the name of the function.
                 return get(self, fn.__name__)
+
             fn = get_fn
         setattr(fn, _PULUMI_NAME, pulumi_name)
         return fn
@@ -601,12 +667,14 @@ def get(self, name: str) -> Any:
             return getattr(dict, "get")(self, name)
         return self.__dict__.get(name)
 
-    # pylint: disable=import-outside-toplevel
     from . import Resource
+
     if isinstance(self, Resource):
         return self.__dict__.get(name)
 
-    raise AssertionError("get can only be used with classes decorated with @input_type or @output_type")
+    raise AssertionError(
+        "get can only be used with classes decorated with @input_type or @output_type"
+    )
 
 
 def set(self, name: str, value: Any) -> None:
@@ -630,58 +698,22 @@ def set(self, name: str, value: Any) -> None:
             self.__dict__[name] = value
         return
 
-    raise AssertionError("set can only be used with classes decorated with @input_type or @output_type")
-
-
-# Use the built-in `get_origin` and `get_args` functions on Python 3.8+,
-# otherwise fallback to downlevel implementations.
-if sys.version_info[:2] >= (3, 8):
-    # pylint: disable=no-member
-    get_origin = typing.get_origin  # type: ignore
-    # pylint: disable=no-member
-    get_args = typing.get_args  # type: ignore
-elif sys.version_info[:2] >= (3, 7):
-    def get_origin(tp):
-        if isinstance(tp, typing._GenericAlias):  # type: ignore
-            return tp.__origin__
-        return None
-
-    def get_args(tp):
-        if isinstance(tp, typing._GenericAlias):  # type: ignore
-            return tp.__args__
-        return ()
-else:
-    def get_origin(tp):
-        if hasattr(tp, "__origin__"):
-            return tp.__origin__
-        return None
-
-    def get_args(tp):
-        # Emulate the behavior of get_args for Union on Python 3.6.
-        if _is_union_type(tp) and hasattr(tp, "_subs_tree"):
-            tree = tp._subs_tree()
-            if isinstance(tree, tuple) and len(tree) > 1:
-                def _eval(args):
-                    return tuple(arg if not isinstance(arg, tuple) else arg[0][_eval(arg[1:])] for arg in args)
-                return _eval(tree[1:])
-        if hasattr(tp, "__args__"):
-            return tp.__args__
-        return ()
+    raise AssertionError(
+        "set can only be used with classes decorated with @input_type or @output_type"
+    )
 
 
 def _is_union_type(tp):
-    if sys.version_info[:2] >= (3, 7):
-        return (tp is Union or
-                isinstance(tp, typing._GenericAlias) and tp.__origin__ is Union)  # type: ignore
-    # pylint: disable=unidiomatic-typecheck, no-member
-    return type(tp) is typing._Union  # type: ignore
+    return (
+        tp is Union or isinstance(tp, typing._GenericAlias) and tp.__origin__ is Union
+    )
 
 
 def _is_optional_type(tp):
     if tp is type(None):
         return True
     if _is_union_type(tp):
-        return any(_is_optional_type(tt) for tt in get_args(tp))
+        return any(_is_optional_type(tt) for tt in typing.get_args(tp))
     return False
 
 
@@ -704,7 +736,6 @@ def _types_from_py_properties(cls: type) -> Dict[str, type]:
     """
     Returns a dict of Pulumi names to types for a type.
     """
-    # pylint: disable=import-outside-toplevel
     from . import Output
 
     # We use get_type_hints() below on each Python property to resolve the getter function's
@@ -750,15 +781,13 @@ def _types_from_py_properties(cls: type) -> Dict[str, type]:
 
 def _pulumi_to_py_names_from_py_properties(cls: type) -> Dict[str, str]:
     return {
-        pulumi_name: python_name
-        for python_name, pulumi_name, _ in _py_properties(cls)
+        pulumi_name: python_name for python_name, pulumi_name, _ in _py_properties(cls)
     }
 
 
 def _py_to_pulumi_names_from_py_properties(cls: type) -> Dict[str, str]:
     return {
-        python_name: pulumi_name
-        for python_name, pulumi_name, _ in _py_properties(cls)
+        python_name: pulumi_name for python_name, pulumi_name, _ in _py_properties(cls)
     }
 
 
@@ -771,7 +800,6 @@ def _types_from_annotations(cls: type) -> Dict[str, type]:
     if not props:
         return {}
 
-    # pylint: disable=import-outside-toplevel
     from . import Output
 
     # We want resolved types for just the cls's type annotations (not base classes),
@@ -812,7 +840,7 @@ def _types_from_annotations(cls: type) -> Dict[str, type]:
 def _names_from_annotations(cls: type) -> Iterator[Tuple[str, str]]:
     # Get annotations that are defined on this class (not base classes).
     # These are returned in the order declared on Python 3.6+.
-    cls_annotations = cls.__dict__.get('__annotations__', {})
+    cls_annotations = cls.__dict__.get("__annotations__", {})
 
     def get_pulumi_name(a_name: str) -> str:
         default = getattr(cls, a_name, MISSING)
@@ -891,7 +919,7 @@ def unwrap_optional_type(val: type) -> type:
     # and any nested Unions are flattened, so Optional[Union[T, U], None] is Union[T, U, None].
     # We'll only "unwrap" for the common case of a single arg T for Union[T, None].
     if _is_optional_type(val):
-        args = get_args(val)
+        args = typing.get_args(val)
         if len(args) == 2:
             assert args[1] is type(None)
             val = args[0]
@@ -903,45 +931,54 @@ def unwrap_type(val: type) -> type:
     """
     Unwraps the type T in Output[T], Input[T], InputType[T], and Optional[T].
     """
-    # pylint: disable=import-outside-toplevel
     from . import Output
 
-    origin = get_origin(val)
+    origin = typing.get_origin(val)
 
     # If it is an Output[T], extract the T arg.
     if origin is Output:
-        args = get_args(val)
+        args = typing.get_args(val)
         assert len(args) == 1
         val = args[0]
 
     # If it looks like Input[T] or InputType[T], extract the T arg.
     if _is_union_type(val):
+
         def isInputType(args):
             assert len(args) > 1
-            return (is_input_type(args[0]) and
-                args[1] is dict or get_origin(args[1]) in {dict, Dict, Mapping, collections.abc.Mapping})
+            return (
+                is_input_type(args[0])
+                and args[1] is dict
+                or typing.get_origin(args[1])
+                in [dict, Dict, Mapping, collections.abc.Mapping]
+            )
 
-        def isInput(args, i = 1):
+        def isInput(args, i=1):
             assert len(args) > i + 1
-            return (get_origin(args[i]) in {typing.Awaitable, collections.abc.Awaitable} and
-                get_origin(args[i + 1]) is Output)
+            return (
+                typing.get_origin(args[i])
+                in {typing.Awaitable, collections.abc.Awaitable}
+                and typing.get_origin(args[i + 1]) is Output
+            )
 
-        args = get_args(val)
+        args = typing.get_args(val)
         if len(args) == 2:
-            if isInputType(args): # InputType[T]
+            if isInputType(args):  # InputType[T]
                 return args[0]
         elif len(args) == 3:
-            if isInput(args): # Input[T]
+            if isInput(args):  # Input[T]
                 return args[0]
-            if isInputType(args) and args[2] is type(None): # Optiona[InputType[T]]
+            if isInputType(args) and args[2] is type(None):  # Optiona[InputType[T]]
                 return args[0]
         elif len(args) == 4:
-            if isInput(args) and args[3] is type(None): # Optional[Input[T]]
+            if isInput(args) and args[3] is type(None):  # Optional[Input[T]]
                 return args[0]
-            if isInputType(args) and isInput(args, 2): # Input[InputType[T]]
+            if isInputType(args) and isInput(args, 2):  # Input[InputType[T]]
                 return args[0]
         elif len(args) == 5:
-            if isInputType(args) and isInput(args, 2) and args[4] is type(None): # Optional[Input[InputType[T]]]
+            if (
+                isInputType(args) and isInput(args, 2) and args[4] is type(None)
+            ):  # Optional[Input[InputType[T]]]
                 return args[0]
 
     return unwrap_optional_type(val)
@@ -949,6 +986,7 @@ def unwrap_type(val: type) -> type:
 
 # The following functions for creating an __init__() method were adapted
 # from Python's dataclasses module.
+
 
 def _create_fn(name, args, body, *, globals=None, locals=None):
     if locals is None:
@@ -965,11 +1003,13 @@ def _create_fn(name, args, body, *, globals=None, locals=None):
     txt = f"def __create_fn__({local_vars}):\n{txt}\n return {name}"
 
     ns = {}
-    exec(txt, globals, ns)  # pylint: disable=exec-used
+    exec(txt, globals, ns)  # noqa: S102 exec builtin
     return ns["__create_fn__"](**locals)
 
 
-def _property_init(python_name: str, prop: _Property, globals, is_dict: bool, has_translate: bool):
+def _property_init(
+    python_name: str, prop: _Property, globals, is_dict: bool, has_translate: bool
+):
     # Return the text of the line in the body of __init__() that will
     # initialize this property.
 
@@ -978,7 +1018,7 @@ def _property_init(python_name: str, prop: _Property, globals, is_dict: bool, ha
         # There's no default, just do an assignment.
         value = python_name
     else:
-        globals[default_name] = python_name
+        globals[default_name] = prop.default
         value = python_name
 
     # Now, actually generate the assignment.
@@ -1027,13 +1067,16 @@ def _init_fn(props: Dict[str, _Property], globals, is_dict: bool, has_translate:
         if prop.default is not MISSING:
             seen_default = True
         elif seen_default:
-            raise TypeError(f"non-default argument {python_name!r} "
-                            "follows default argument")
+            raise TypeError(
+                f"non-default argument {python_name!r} " "follows default argument"
+            )
 
     locals = {f"_type_{python_name}": prop.type for python_name, prop in props.items()}
-    locals.update({
-        "MISSING": MISSING,
-    })
+    locals.update(
+        {
+            "MISSING": MISSING,
+        }
+    )
 
     body_lines = []
     for python_name, prop in props.items():
@@ -1049,8 +1092,11 @@ def _init_fn(props: Dict[str, _Property], globals, is_dict: bool, has_translate:
     if len(props) > 0:
         first_args += ["*"]
 
-    return _create_fn("__init__",
-                      first_args + [_init_param(python_name, prop) for python_name, prop in props.items()],
-                      body_lines,
-                      locals=locals,
-                      globals=globals)
+    return _create_fn(
+        "__init__",
+        first_args
+        + [_init_param(python_name, prop) for python_name, prop in props.items()],
+        body_lines,
+        locals=locals,
+        globals=globals,
+    )

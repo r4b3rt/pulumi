@@ -16,7 +16,7 @@ package httputil
 
 import (
 	"crypto/tls"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -55,6 +55,8 @@ func http2ServerAndClient(handler http.Handler) (*httptest.Server, *http.Client)
 
 // Test that DoWithRetry rewinds and resends the request body when retrying POSTs over HTTP/2.
 func TestRetryPostHTTP2(t *testing.T) {
+	t.Parallel()
+
 	tries := 0
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		tries++
@@ -64,7 +66,7 @@ func TestRetryPostHTTP2(t *testing.T) {
 
 		// Check that the body's content length matches the sent data.
 		defer r.Body.Close()
-		content, err := ioutil.ReadAll(r.Body)
+		content, err := io.ReadAll(r.Body)
 		assert.NoError(t, err)
 		assert.Equal(t, strconv.Itoa(len(content)), r.Header.Get("Content-Length"))
 

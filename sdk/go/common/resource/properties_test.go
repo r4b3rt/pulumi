@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2021, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,6 +24,8 @@ import (
 // TestMappable ensures that we properly convert from resource property maps to their "weakly typed" JSON-like
 // equivalents.
 func TestMappable(t *testing.T) {
+	t.Parallel()
+
 	ma1 := map[string]interface{}{
 		"a": float64(42.3),
 		"b": false,
@@ -45,6 +47,8 @@ func TestMappable(t *testing.T) {
 // TestMapReplValues ensures that we properly convert from resource property maps to their "weakly typed" JSON-like
 // equivalents, but with additional and optional functions that replace values inline as we go.
 func TestMapReplValues(t *testing.T) {
+	t.Parallel()
+
 	// First, no replacements (nil repl).
 	ma1 := map[string]interface{}{
 		"a": float64(42.3),
@@ -109,6 +113,8 @@ func TestMapReplValues(t *testing.T) {
 }
 
 func TestMapReplKeys(t *testing.T) {
+	t.Parallel()
+
 	m := map[string]interface{}{
 		"a": float64(42.3),
 		"b": false,
@@ -135,9 +141,11 @@ func TestMapReplKeys(t *testing.T) {
 }
 
 func TestMapReplComputedOutput(t *testing.T) {
+	t.Parallel()
+
 	m := make(PropertyMap)
-	m["a"] = NewComputedProperty(Computed{Element: NewStringProperty("X")})
-	m["b"] = NewOutputProperty(Output{Element: NewNumberProperty(46)})
+	m["a"] = NewProperty(Computed{Element: NewProperty("X")})
+	m["b"] = NewProperty(Output{Element: NewProperty(46.0)})
 	mm := m.MapRepl(nil, nil)
 	assert.Equal(t, len(m), len(mm))
 	m2 := NewPropertyMapFromMap(mm)
@@ -145,6 +153,8 @@ func TestMapReplComputedOutput(t *testing.T) {
 }
 
 func TestCopy(t *testing.T) {
+	t.Parallel()
+
 	src := NewPropertyMapFromMap(map[string]interface{}{
 		"a": "str",
 		"b": 42,
@@ -155,18 +165,265 @@ func TestCopy(t *testing.T) {
 	assert.Equal(t, src["a"], dst["a"])
 	assert.Equal(t, src["b"], dst["b"])
 	src["a"] = NewNullProperty()
-	assert.Equal(t, NewStringProperty("str"), dst["a"])
-	src["c"] = NewNumberProperty(99.99)
+	assert.Equal(t, NewProperty("str"), dst["a"])
+	src["c"] = NewProperty(99.99)
 	assert.Equal(t, 2, len(dst))
 }
 
 func TestSecretUnknown(t *testing.T) {
-	o := NewOutputProperty(Output{Element: NewNumberProperty(46)})
+	t.Parallel()
+
+	o := NewProperty(Output{Element: NewProperty(46.0)})
 	so := MakeSecret(o)
 	assert.True(t, o.ContainsUnknowns())
 	assert.True(t, so.ContainsUnknowns())
-	c := NewComputedProperty(Computed{Element: NewStringProperty("X")})
+	c := NewProperty(Computed{Element: NewProperty("X")})
 	co := MakeSecret(so)
 	assert.True(t, c.ContainsUnknowns())
 	assert.True(t, co.ContainsUnknowns())
+}
+
+func TestTypeString(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		prop     PropertyValue
+		expected string
+	}{
+		{
+			prop:     MakeComputed(NewProperty("")),
+			expected: "output<string>",
+		},
+		{
+			prop:     MakeSecret(NewProperty("")),
+			expected: "secret<string>",
+		},
+		{
+			prop:     MakeOutput(NewProperty("")),
+			expected: "output<string>",
+		},
+		{
+			prop: NewProperty(Output{
+				Element: NewProperty(""),
+				Known:   true,
+			}),
+			expected: "string",
+		},
+		{
+			prop: NewProperty(Output{
+				Element: NewProperty(""),
+				Known:   true,
+				Secret:  true,
+			}),
+			expected: "secret<string>",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.expected, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tt.expected, tt.prop.TypeString())
+		})
+	}
+}
+
+func TestString(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		prop     PropertyValue
+		expected string
+	}{
+		{
+			prop:     MakeComputed(NewProperty("")),
+			expected: "output<string>{}",
+		},
+		{
+			prop:     MakeSecret(NewProperty("shh")),
+			expected: "{&{{shh}}}",
+		},
+		{
+			prop:     MakeOutput(NewProperty("")),
+			expected: "output<string>{}",
+		},
+		{
+			prop: NewProperty(Output{
+				Element: NewProperty("hello"),
+				Known:   true,
+			}),
+			expected: "{hello}",
+		},
+		{
+			prop: NewProperty(Output{
+				Element: NewProperty("shh"),
+				Known:   true,
+				Secret:  true,
+			}),
+			expected: "{&{{shh}}}",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.expected, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tt.expected, tt.prop.String())
+		})
+	}
+}
+
+func TestContainsUnknowns(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		prop     PropertyValue
+		expected bool
+	}{
+		{
+			name:     "computed unknown",
+			prop:     MakeComputed(NewProperty("")),
+			expected: true,
+		},
+		{
+			name:     "output unknown",
+			prop:     MakeOutput(NewProperty("")),
+			expected: true,
+		},
+		{
+			name: "output known",
+			prop: NewProperty(Output{
+				Element: NewProperty(""),
+				Known:   true,
+			}),
+			expected: false,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tt.expected, tt.prop.ContainsUnknowns())
+		})
+	}
+}
+
+func TestContainsSecrets(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		prop     PropertyValue
+		expected bool
+	}{
+		{
+			name:     "secret",
+			prop:     MakeSecret(NewProperty("")),
+			expected: true,
+		},
+		{
+			name:     "output unknown",
+			prop:     MakeOutput(NewProperty("")),
+			expected: false,
+		},
+		{
+			name:     "output unknown containing secret",
+			prop:     MakeOutput(MakeSecret(NewProperty(""))),
+			expected: true,
+		},
+		{
+			name: "output unknown secret",
+			prop: NewProperty(Output{
+				Element: NewProperty(""),
+				Secret:  true,
+			}),
+			expected: true,
+		},
+		{
+			name: "output known secret",
+			prop: NewProperty(Output{
+				Element: NewProperty(""),
+				Known:   true,
+				Secret:  true,
+			}),
+			expected: true,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tt.expected, tt.prop.ContainsSecrets())
+		})
+	}
+}
+
+func TestHasValue(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		prop     PropertyValue
+		expected bool
+	}{
+		{
+			name:     "null",
+			prop:     NewNullProperty(),
+			expected: false,
+		},
+		{
+			name:     "string",
+			prop:     NewProperty(""),
+			expected: true,
+		},
+		{
+			name:     "output unknown",
+			prop:     MakeOutput(NewProperty("")),
+			expected: false,
+		},
+		{
+			name: "output known",
+			prop: NewProperty(Output{
+				Element: NewProperty(""),
+				Known:   true,
+			}),
+			expected: true,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tt.expected, tt.prop.HasValue())
+		})
+	}
+}
+
+// Test for https://github.com/pulumi/pulumi/issues/16889
+func TestMapFromMapNestedPropertyValues(t *testing.T) {
+	t.Parallel()
+
+	actual := NewPropertyMapFromMap(map[string]interface{}{
+		"prop": NewStringProperty("value"),
+		"nested": map[string]interface{}{
+			"obj": NewObjectProperty(PropertyMap{
+				"k": NewStringProperty("v"),
+			}),
+		},
+	})
+
+	expected := PropertyMap{
+		"prop": NewStringProperty("value"),
+		"nested": NewObjectProperty(PropertyMap{
+			"obj": NewObjectProperty(PropertyMap{
+				"k": NewStringProperty("v"),
+			}),
+		}),
+	}
+
+	assert.Equal(t, expected, actual)
 }

@@ -18,10 +18,13 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/pulumi/pulumi/sdk/v3/go/internal"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestDeepCopy(t *testing.T) {
+	t.Parallel()
+
 	cases := []interface{}{
 		bool(false),
 		bool(true),
@@ -72,9 +75,21 @@ func TestDeepCopy(t *testing.T) {
 			"bar": []int{42},
 		},
 	}
+	//nolint:paralleltest // false positive because range var isn't used directly in t.Run(name) arg
 	for i, c := range cases {
+		i, c := i, c
 		t.Run(fmt.Sprintf("case %d", i), func(t *testing.T) {
+			t.Parallel()
 			assert.EqualValues(t, c, Copy(c))
 		})
 	}
+}
+
+func TestDeepCopyDoesntCopyOutputState(t *testing.T) {
+	t.Parallel()
+
+	state := internal.OutputState{}
+	assert.PanicsWithValue(t, "fatal: A failure has occurred: Outputs cannot be deep copied", func() {
+		Copy(state)
+	})
 }

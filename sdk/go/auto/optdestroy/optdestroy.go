@@ -52,10 +52,17 @@ func TargetDependents() Option {
 	})
 }
 
-// ProgressStreams allows specifying one or more io.Writers to redirect incremental destroy output
+// ProgressStreams allows specifying one or more io.Writers to redirect incremental destroy stdout
 func ProgressStreams(writers ...io.Writer) Option {
 	return optionFunc(func(opts *Options) {
 		opts.ProgressStreams = writers
+	})
+}
+
+// ErrorProgressStreams allows specifying one or more io.Writers to redirect incremental destroy stderr
+func ErrorProgressStreams(writers ...io.Writer) Option {
+	return optionFunc(func(opts *Options) {
+		opts.ErrorProgressStreams = writers
 	})
 }
 
@@ -80,6 +87,63 @@ func UserAgent(agent string) Option {
 	})
 }
 
+// Color allows specifying whether to colorize output. Choices are: always, never, raw, auto (default "auto")
+func Color(color string) Option {
+	return optionFunc(func(opts *Options) {
+		opts.Color = color
+	})
+}
+
+// ShowSecrets configures whether to show config secrets when they appear.
+func ShowSecrets(show bool) Option {
+	return optionFunc(func(opts *Options) {
+		opts.ShowSecrets = &show
+	})
+}
+
+// Refresh will run a refresh before the destroy.
+func Refresh() Option {
+	return optionFunc(func(opts *Options) {
+		opts.Refresh = true
+	})
+}
+
+// Suppress display of periodic progress dots
+func SuppressProgress() Option {
+	return optionFunc(func(opts *Options) {
+		opts.SuppressProgress = true
+	})
+}
+
+// Suppress display of stack outputs (in case they contain sensitive values)
+func SuppressOutputs() Option {
+	return optionFunc(func(opts *Options) {
+		opts.SuppressOutputs = true
+	})
+}
+
+// Continue to perform the destroy operation despite the occurrence of errors.
+func ContinueOnError() Option {
+	return optionFunc(func(opts *Options) {
+		opts.ContinueOnError = true
+	})
+}
+
+// Remove the stack and its configuration after all resources in the stack have
+// been deleted.
+func Remove() Option {
+	return optionFunc(func(opts *Options) {
+		opts.Remove = true
+	})
+}
+
+// ConfigFile specifies a file to use for configuration values rather than detecting the file name
+func ConfigFile(path string) Option {
+	return optionFunc(func(opts *Options) {
+		opts.ConfigFile = path
+	})
+}
+
 // Option is a parameter to be applied to a Stack.Destroy() operation
 type Option interface {
 	ApplyOption(*Options)
@@ -98,14 +162,33 @@ type Options struct {
 	Target []string
 	// Allows updating of dependent targets discovered but not specified in the Target list
 	TargetDependents bool
-	// ProgressStreams allows specifying one or more io.Writers to redirect incremental destroy output
+	// ProgressStreams allows specifying one or more io.Writers to redirect incremental destroy stdout
 	ProgressStreams []io.Writer
+	// ProgressStreams allows specifying one or more io.Writers to redirect incremental destroy stderr
+	ErrorProgressStreams []io.Writer
 	// EventStreams allows specifying one or more channels to receive the Pulumi event stream
 	EventStreams []chan<- events.EngineEvent
 	// DebugLogOpts specifies additional settings for debug logging
 	DebugLogOpts debug.LoggingOptions
 	// UserAgent specifies the agent responsible for the update, stored in backends as "environment.exec.agent"
 	UserAgent string
+	// Colorize output. Choices are: always, never, raw, auto (default "auto")
+	Color string
+	// Show config secrets when they appear.
+	ShowSecrets *bool
+	// Refresh will run a refresh before the destroy.
+	Refresh bool
+	// Suppress display of periodic progress dots
+	SuppressProgress bool
+	// Suppress display of stack outputs (in case they contain sensitive values)
+	SuppressOutputs bool
+	// Continue to perform the destroy operation despite the occurrence of errors.
+	ContinueOnError bool
+	// Remove the stack and its configuration after all resources in the stack
+	// have been deleted.
+	Remove bool
+	// Run using the configuration values in the specified file rather than detecting the file name
+	ConfigFile string
 }
 
 type optionFunc func(*Options)

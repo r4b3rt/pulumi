@@ -15,64 +15,117 @@
 package engine
 
 import (
+	"context"
+	"fmt"
+
+	"github.com/pulumi/pulumi/pkg/v3/display"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/util/result"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
-func Destroy(u UpdateInfo, ctx *Context, opts UpdateOptions, dryRun bool) (ResourceChanges, result.Result) {
-	contract.Require(u != nil, "u")
-	contract.Require(ctx != nil, "ctx")
+func Destroy(
+	u UpdateInfo,
+	ctx *Context,
+	opts UpdateOptions,
+	dryRun bool,
+) (*deploy.Plan, display.ResourceChanges, error) {
+	contract.Requiref(u != nil, "u", "cannot be nil")
+	contract.Requiref(ctx != nil, "ctx", "cannot be nil")
 
-	defer func() { ctx.Events <- cancelEvent() }()
+	defer func() { ctx.Events <- NewCancelEvent() }()
 
 	info, err := newDeploymentContext(u, "destroy", ctx.ParentSpan)
 	if err != nil {
-		return nil, result.FromError(err)
+		return nil, nil, err
 	}
 	defer info.Close()
 
 	emitter, err := makeEventEmitter(ctx.Events, u)
 	if err != nil {
-		return nil, result.FromError(err)
+		return nil, nil, err
 	}
 	defer emitter.Close()
 
-	return update(ctx, info, deploymentOptions{
+	logging.V(7).Infof("*** Starting Destroy(preview=%v) ***", dryRun)
+	defer logging.V(7).Infof("*** Destroy(preview=%v) complete ***", dryRun)
+
+	if err := checkTargets(opts.Targets, u.GetTarget().Snapshot); err != nil {
+		return nil, nil, err
+	}
+
+	return update(ctx, info, &deploymentOptions{
 		UpdateOptions: opts,
 		SourceFunc:    newDestroySource,
 		Events:        emitter,
 		Diag:          newEventSink(emitter, false),
 		StatusDiag:    newEventSink(emitter, true),
-	}, dryRun)
+		DryRun:        dryRun,
+	})
 }
 
 func newDestroySource(
-	client deploy.BackendClient, opts deploymentOptions, proj *workspace.Project, pwd, main string,
-	target *deploy.Target, plugctx *plugin.Context, dryRun bool) (deploy.Source, error) {
+	ctx context.Context,
+	client deploy.BackendClient, opts *deploymentOptions, proj *workspace.Project, pwd, main, projectRoot string,
+	target *deploy.Target, plugctx *plugin.Context,
+) (deploy.Source, error) {
+	// Like update, we need to gather the set of plugins necessary to delete everything in the snapshot. While we don't
+	// run the program like update does, we still grab the plugins from the program in order to inform the user if their
+	// program has updates to plugins that will not be used as part of the destroy operation. In the event that there is
+	// no root directory/Pulumi.yaml (perhaps as the result of a command to which an explicit stack name has been passed),
+	// we'll populate an empty set of program plugins.
 
-	// Like Update, we need to gather the set of plugins necessary to delete everything in the snapshot.
-	// Unlike Update, we don't actually run the user's program so we only need the set of plugins described
-	// in the snapshot.
-	plugins, err := gatherPluginsFromSnapshot(plugctx, target)
+	var programPackages PackageSet
+	if plugctx.Root != "" {
+		runtime := proj.Runtime.Name()
+		programInfo := plugin.NewProgramInfo(
+			/* rootDirectory */ plugctx.Root,
+			/* programDirectory */ pwd,
+			/* entryPoint */ main,
+			/* options */ proj.Runtime.Options(),
+		)
+
+		var err error
+		programPackages, err = gatherPackagesFromProgram(plugctx, runtime, programInfo)
+		if err != nil {
+			programPackages = NewPackageSet()
+		}
+	} else {
+		programPackages = NewPackageSet()
+	}
+
+	snapshotPackages, err := gatherPackagesFromSnapshot(plugctx, target)
 	if err != nil {
 		return nil, err
 	}
 
+	packageUpdates := programPackages.UpdatesTo(snapshotPackages)
+	if len(packageUpdates) > 0 {
+		for _, update := range packageUpdates {
+			plugctx.Diag.Warningf(diag.Message("", fmt.Sprintf(
+				"destroy operation is using an older version of package '%s' than the specified program version: %s < %s",
+				update.New.PackageName(), update.Old.PackageVersion(), update.New.PackageVersion(),
+			)))
+		}
+	}
+
 	// Like Update, if we're missing plugins, attempt to download the missing plugins.
-	if err := ensurePluginsAreInstalled(plugins); err != nil {
+	allPlugins := snapshotPackages.ToPluginSet().Deduplicate()
+
+	if err := EnsurePluginsAreInstalled(ctx, opts, plugctx.Diag, allPlugins,
+		plugctx.Host.GetProjectPlugins(), false /*reinstall*/, false /*explicitInstall*/); err != nil {
 		logging.V(7).Infof("newDestroySource(): failed to install missing plugins: %v", err)
 	}
 
 	// We don't need the language plugin, since destroy doesn't run code, so we will leave that out.
-	if err := ensurePluginsAreLoaded(plugctx, plugins, plugin.AnalyzerPlugins); err != nil {
+	if err := ensurePluginsAreLoaded(plugctx, allPlugins, plugin.AnalyzerPlugins); err != nil {
 		return nil, err
 	}
 
 	// Create a nil source.  This simply returns "nothing" as the new state, which will cause the
 	// engine to destroy the entire existing state.
-	return deploy.NullSource, nil
+	return deploy.NewNullSource(proj.Name), nil
 }

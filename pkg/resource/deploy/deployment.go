@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2024, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,22 +16,26 @@ package deploy
 
 import (
 	"context"
+	"fmt"
 	"math"
+	"regexp"
+	"strings"
 	"sync"
 
-	"github.com/blang/semver"
 	uuid "github.com/gofrs/uuid"
-	"github.com/pkg/errors"
 
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	"github.com/pulumi/pulumi/pkg/v3/resource/autonaming"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/providers"
 	"github.com/pulumi/pulumi/pkg/v3/resource/graph"
+	"github.com/pulumi/pulumi/pkg/v3/util/gsync"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/util/result"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
 // BackendClient is used to retrieve information about stacks from a backend.
@@ -49,23 +53,44 @@ type BackendClient interface {
 
 // Options controls the deployment process.
 type Options struct {
-	Events                    Events         // an optional events callback interface.
-	Parallel                  int            // the degree of parallelism for resource operations (<=1 for serial).
-	Refresh                   bool           // whether or not to refresh before executing the deployment.
-	RefreshOnly               bool           // whether or not to exit after refreshing.
-	RefreshTargets            []resource.URN // The specific resources to refresh during a refresh op.
-	ReplaceTargets            []resource.URN // Specific resources to replace.
-	DestroyTargets            []resource.URN // Specific resources to destroy.
-	UpdateTargets             []resource.URN // Specific resources to update.
-	TargetDependents          bool           // true if we're allowing things to proceed, even with unspecified targets
-	TrustDependencies         bool           // whether or not to trust the resource dependency graph.
-	UseLegacyDiff             bool           // whether or not to use legacy diffing behavior.
-	DisableResourceReferences bool           // true to disable resource reference support.
+	// true if the process is a dry run (that is, won't make any changes), such as
+	// during a preview action or when previewing another action like refresh or
+	// destroy.
+	DryRun bool
+	// the degree of parallelism for resource operations (<=1 for serial).
+	Parallel int32
+	// whether or not to refresh before executing the deployment.
+	Refresh bool
+	// whether or not to exit after refreshing (i.e. this is specifically a
+	// refresh operation).
+	RefreshOnly bool
+	// if specified, only operate on the specified resources.
+	Targets UrnTargets
+	// if specified, mark the specified resources for replacement.
+	ReplaceTargets UrnTargets
+	// true if target dependents should be computed automatically.
+	TargetDependents bool
+	// whether or not to use legacy diffing behavior.
+	UseLegacyDiff bool
+	// true if the deployment should use legacy refresh diffing behavior and
+	// report only output changes, as opposed to computing diffs against desired
+	// state.
+	UseLegacyRefreshDiff bool
+	// true to disable resource reference support.
+	DisableResourceReferences bool
+	// true to disable output value support.
+	DisableOutputValues bool
+	// true to enable plan generation.
+	GeneratePlan bool
+	// true if we should continue with the deployment even if a resource operation fails.
+	ContinueOnError bool
+	// Autonamer can resolve user's preference for custom autonaming options for a given resource.
+	Autonamer autonaming.Autonamer
 }
 
 // DegreeOfParallelism returns the degree of parallelism that should be used during the
 // deployment process.
-func (o Options) DegreeOfParallelism() int {
+func (o Options) DegreeOfParallelism() int32 {
 	if o.Parallel <= 1 {
 		return 1
 	}
@@ -75,6 +100,115 @@ func (o Options) DegreeOfParallelism() int {
 // InfiniteParallelism returns whether or not the requested level of parallelism is unbounded.
 func (o Options) InfiniteParallelism() bool {
 	return o.Parallel == math.MaxInt32
+}
+
+// An immutable set of urns to target with an operation.
+//
+// The zero value of UrnTargets is the set of all URNs.
+type UrnTargets struct {
+	// UrnTargets is internally made up of two components: literals, which are fully
+	// specified URNs and globs, which are partially specified URNs.
+
+	literals []resource.URN
+	globs    map[string]*regexp.Regexp
+}
+
+// Create a new set of targets.
+//
+// Each element is considered a glob if it contains any '*' and an URN otherwise. No other
+// URN validation is performed.
+//
+// If len(urnOrGlobs) == 0, an unconstrained set will be created.
+func NewUrnTargets(urnOrGlobs []string) UrnTargets {
+	literals, globs := []resource.URN{}, map[string]*regexp.Regexp{}
+	for _, urn := range urnOrGlobs {
+		if strings.ContainsRune(urn, '*') {
+			globs[urn] = nil
+		} else {
+			literals = append(literals, resource.URN(urn))
+		}
+	}
+	return UrnTargets{literals, globs}
+}
+
+// Create a new set of targets from fully resolved URNs.
+func NewUrnTargetsFromUrns(urns []resource.URN) UrnTargets {
+	return UrnTargets{urns, nil}
+}
+
+// Return a copy of the UrnTargets
+func (t UrnTargets) Clone() UrnTargets {
+	newLiterals := append(make([]resource.URN, 0, len(t.literals)), t.literals...)
+	newGlobs := make(map[string]*regexp.Regexp, len(t.globs))
+	for k, v := range t.globs {
+		newGlobs[k] = v
+	}
+	return UrnTargets{
+		literals: newLiterals,
+		globs:    newGlobs,
+	}
+}
+
+// Return if the target set constrains the set of acceptable URNs.
+func (t UrnTargets) IsConstrained() bool {
+	return len(t.literals) > 0 || len(t.globs) > 0
+}
+
+// Get a regexp that can match on the glob. This function caches regexp generation.
+func (t UrnTargets) getMatcher(glob string) *regexp.Regexp {
+	if r := t.globs[glob]; r != nil {
+		return r
+	}
+	segmentGlob := strings.Split(glob, "**")
+	for i, v := range segmentGlob {
+		part := strings.Split(v, "*")
+		for i, v := range part {
+			part[i] = regexp.QuoteMeta(v)
+		}
+		segmentGlob[i] = strings.Join(part, "[^:]*")
+	}
+
+	// Because we have quoted all input, this is safe to compile.
+	r := regexp.MustCompile("^" + strings.Join(segmentGlob, ".*") + "$")
+
+	// We cache and return the matcher
+	t.globs[glob] = r
+	return r
+}
+
+// Check if Targets contains the URN.
+//
+// If method receiver is not initialized, `true` is always returned.
+func (t UrnTargets) Contains(urn resource.URN) bool {
+	if !t.IsConstrained() {
+		return true
+	}
+	for _, literal := range t.literals {
+		if literal == urn {
+			return true
+		}
+	}
+	for glob := range t.globs {
+		if t.getMatcher(glob).MatchString(string(urn)) {
+			return true
+		}
+	}
+	return false
+}
+
+// URN literals specified as targets.
+//
+// It doesn't make sense to iterate over all targets, since the list of targets may be
+// infinite.
+func (t UrnTargets) Literals() []resource.URN {
+	return t.literals
+}
+
+// Adds a literal iff t is already initialized.
+func (t *UrnTargets) addLiteral(urn resource.URN) {
+	if t.IsConstrained() {
+		t.literals = append(t.literals, urn)
+	}
 }
 
 // StepExecutorEvents is an interface that can be used to hook resource lifecycle events.
@@ -87,6 +221,7 @@ type StepExecutorEvents interface {
 // PolicyEvents is an interface that can be used to hook policy events.
 type PolicyEvents interface {
 	OnPolicyViolation(resource.URN, plugin.AnalyzeDiagnostic)
+	OnPolicyRemediation(resource.URN, plugin.Remediation, resource.PropertyMap, resource.PropertyMap)
 }
 
 // Events is an interface that can be used to hook interesting engine events.
@@ -95,73 +230,80 @@ type Events interface {
 	PolicyEvents
 }
 
-// PlanPendingOperationsError is an error returned from `NewPlan` if there exist pending operations in the
-// snapshot that we are preparing to operate upon. The engine does not allow any operations to be pending
-// when operating on a snapshot.
-type PlanPendingOperationsError struct {
-	Operations []resource.Operation
+type resourcePlans struct {
+	m     sync.RWMutex
+	plans Plan
 }
 
-func (p PlanPendingOperationsError) Error() string {
-	return "one or more operations are currently pending"
-}
-
-type goalMap struct {
-	m sync.Map
-}
-
-func (m *goalMap) set(urn resource.URN, goal *resource.Goal) {
-	m.m.Store(urn, goal)
-}
-
-func (m *goalMap) get(urn resource.URN) (*resource.Goal, bool) {
-	g, ok := m.m.Load(urn)
-	if !ok {
-		return nil, false
+func newResourcePlan(config config.Map) *resourcePlans {
+	return &resourcePlans{
+		plans: NewPlan(config),
 	}
-	return g.(*resource.Goal), true
 }
 
-type resourceMap struct {
-	m sync.Map
-}
+func (m *resourcePlans) set(urn resource.URN, plan *ResourcePlan) {
+	m.m.Lock()
+	defer m.m.Unlock()
 
-func (m *resourceMap) set(urn resource.URN, state *resource.State) {
-	m.m.Store(urn, state)
-}
-
-func (m *resourceMap) get(urn resource.URN) (*resource.State, bool) {
-	s, ok := m.m.Load(urn)
-	if !ok {
-		return nil, false
+	if _, ok := m.plans.ResourcePlans[urn]; ok {
+		panic(fmt.Sprintf("tried to set resource plan for %s but it's already been set", urn))
 	}
-	return s.(*resource.State), true
+
+	m.plans.ResourcePlans[urn] = plan
 }
 
-func (m *resourceMap) mapRange(callback func(urn resource.URN, state *resource.State) bool) {
-	m.m.Range(func(k, v interface{}) bool {
-		return callback(k.(resource.URN), v.(*resource.State))
-	})
+func (m *resourcePlans) get(urn resource.URN) (*ResourcePlan, bool) {
+	m.m.RLock()
+	defer m.m.RUnlock()
+
+	p, ok := m.plans.ResourcePlans[urn]
+	return p, ok
+}
+
+func (m *resourcePlans) plan() *Plan {
+	return &m.plans
 }
 
 // A Deployment manages the iterative computation and execution of a deployment based on a stream of goal states.
 // A running deployment emits events that indicate its progress. These events must be used to record the new state
 // of the deployment target.
 type Deployment struct {
-	ctx                  *plugin.Context                  // the plugin context (for provider operations).
-	target               *Target                          // the deployment target.
-	prev                 *Snapshot                        // the old resource snapshot for comparison.
-	olds                 map[resource.URN]*resource.State // a map of all old resources.
-	imports              []Import                         // resources to import, if this is an import deployment.
-	isImport             bool                             // true if this is an import deployment.
-	schemaLoader         schema.Loader                    // the schema cache for this deployment, if any.
-	source               Source                           // the source of new resources.
-	localPolicyPackPaths []string                         // the policy packs to run during this deployment's generation.
-	preview              bool                             // true if this deployment is to be previewed.
-	depGraph             *graph.DependencyGraph           // the dependency graph of the old snapshot.
-	providers            *providers.Registry              // the provider registry for this deployment.
-	goals                *goalMap                         // the set of resource goals generated by the deployment.
-	news                 *resourceMap                     // the set of new resources generated by the deployment.
+	// the plugin context (for provider operations).
+	ctx *plugin.Context
+	// options for this deployment.
+	opts *Options
+	// event handlers for this deployment.
+	events Events
+	// the deployment target.
+	target *Target
+	// the old resource snapshot for comparison.
+	prev *Snapshot
+	// a map of all old resources.
+	olds map[resource.URN]*resource.State
+	// a map of all planned resource changes, if any.
+	plan *Plan
+	// resources to import, if this is an import deployment.
+	imports []Import
+	// true if this is an import deployment.
+	isImport bool
+	// the schema cache for this deployment, if any.
+	schemaLoader schema.Loader
+	// the source of new resources.
+	source Source
+	// the policy packs to run during this deployment's generation.
+	localPolicyPackPaths []string
+	// the dependency graph of the old snapshot.
+	depGraph *graph.DependencyGraph
+	// the provider registry for this deployment.
+	providers *providers.Registry
+	// the set of resource goals generated by the deployment.
+	goals *gsync.Map[resource.URN, *resource.Goal]
+	// the set of new resources generated by the deployment.
+	news *gsync.Map[resource.URN, *resource.State]
+	// the set of new resource plans.
+	newPlans *resourcePlans
+	// the set of resources read as part of the deployment
+	reads *gsync.Map[resource.URN, *resource.State]
 }
 
 // addDefaultProviders adds any necessary default provider definitions and references to the given snapshot. Version
@@ -173,9 +315,9 @@ func addDefaultProviders(target *Target, source Source, prev *Snapshot) error {
 	}
 
 	// Pull the versions we'll use for default providers from the snapshot's manifest.
-	defaultProviderVersions := make(map[tokens.Package]*semver.Version)
+	defaultProviderInfo := make(map[tokens.Package]workspace.PluginSpec)
 	for _, p := range prev.Manifest.Plugins {
-		defaultProviderVersions[tokens.Package(p.Name)] = p.Version
+		defaultProviderInfo[tokens.Package(p.Name)] = p.Spec()
 	}
 
 	// Determine the necessary set of default providers and inject references to default providers as appropriate.
@@ -197,10 +339,12 @@ func addDefaultProviders(target *Target, source Source, prev *Snapshot) error {
 		if !ok {
 			inputs, err := target.GetPackageConfig(pkg)
 			if err != nil {
-				return errors.Errorf("could not fetch configuration for default provider '%v'", pkg)
+				return fmt.Errorf("could not fetch configuration for default provider '%v'", pkg)
 			}
-			if version, ok := defaultProviderVersions[pkg]; ok {
-				inputs["version"] = resource.NewStringProperty(version.String())
+			if pkgInfo, ok := defaultProviderInfo[pkg]; ok {
+				providers.SetProviderVersion(inputs, pkgInfo.Version)
+				providers.SetProviderURL(inputs, pkgInfo.PluginDownloadURL)
+				providers.SetProviderChecksums(inputs, pkgInfo.Checksums)
 			}
 
 			uuid, err := uuid.NewV4()
@@ -210,7 +354,8 @@ func addDefaultProviders(target *Target, source Source, prev *Snapshot) error {
 
 			urn, id := defaultProviderURN(target, source, pkg), resource.ID(uuid.String())
 			ref, err = providers.NewReference(urn, id)
-			contract.Assert(err == nil)
+			contract.Assertf(err == nil,
+				"could not create provider reference with URN %v and ID %v", urn, id)
 
 			provider := &resource.State{
 				Type:    urn.Type(),
@@ -255,7 +400,14 @@ func migrateProviders(target *Target, prev *Snapshot, source Source) error {
 			// provider outputs, and a provider is being upgraded from a version that did not implement DiffConfig to
 			// a version that does.
 			if providers.IsProviderType(res.URN.Type()) && len(res.Inputs) != 0 && len(res.Outputs) == 0 {
-				res.Outputs = res.Inputs
+				// Importantly DO NOT copy the __internal key to the outputs. This key is only expected on inputs.
+				res.Outputs = make(resource.PropertyMap)
+				for k, v := range res.Inputs {
+					if k == "__internal" {
+						continue
+					}
+					res.Outputs[k] = v
+				}
 			}
 		}
 	}
@@ -269,10 +421,6 @@ func buildResourceMap(prev *Snapshot, preview bool) ([]*resource.State, map[reso
 		return nil, olds, nil
 	}
 
-	if prev.PendingOperations != nil && !preview {
-		return nil, nil, PlanPendingOperationsError{prev.PendingOperations}
-	}
-
 	for _, oldres := range prev.Resources {
 		// Ignore resources that are pending deletion; these should not be recorded in the LUT.
 		if oldres.Delete {
@@ -281,7 +429,7 @@ func buildResourceMap(prev *Snapshot, preview bool) ([]*resource.State, map[reso
 
 		urn := oldres.URN
 		if olds[urn] != nil {
-			return nil, nil, errors.Errorf("unexpected duplicate resource '%s'", urn)
+			return nil, nil, fmt.Errorf("unexpected duplicate resource '%s'", urn)
 		}
 		olds[urn] = oldres
 	}
@@ -298,12 +446,20 @@ func buildResourceMap(prev *Snapshot, preview bool) ([]*resource.State, map[reso
 //
 // Note that a deployment uses internal concurrency and parallelism in various ways, so it must be closed if for some
 // reason it isn't carried out to its final conclusion. This will result in cancellation and reclamation of resources.
-func NewDeployment(ctx *plugin.Context, target *Target, prev *Snapshot, source Source,
-	localPolicyPackPaths []string, preview bool, backendClient BackendClient) (*Deployment, error) {
-
-	contract.Assert(ctx != nil)
-	contract.Assert(target != nil)
-	contract.Assert(source != nil)
+func NewDeployment(
+	ctx *plugin.Context,
+	opts *Options,
+	events Events,
+	target *Target,
+	prev *Snapshot,
+	plan *Plan,
+	source Source,
+	localPolicyPackPaths []string,
+	backendClient BackendClient,
+) (*Deployment, error) {
+	contract.Requiref(ctx != nil, "ctx", "must not be nil")
+	contract.Requiref(target != nil, "target", "must not be nil")
+	contract.Requiref(source != nil, "source", "must not be nil")
 
 	if err := migrateProviders(target, prev, source); err != nil {
 		return nil, err
@@ -313,7 +469,7 @@ func NewDeployment(ctx *plugin.Context, target *Target, prev *Snapshot, source S
 	//
 	// NOTE: we can and do mutate prev.Resources, olds, and depGraph during execution after performing a refresh. See
 	// deploymentExecutor.refresh for details.
-	oldResources, olds, err := buildResourceMap(prev, preview)
+	oldResources, olds, err := buildResourceMap(prev, opts.DryRun)
 	if err != nil {
 		return nil, err
 	}
@@ -322,34 +478,37 @@ func NewDeployment(ctx *plugin.Context, target *Target, prev *Snapshot, source S
 	depGraph := graph.NewDependencyGraph(oldResources)
 
 	// Create a goal map for the deployment.
-	newGoals := &goalMap{}
+	newGoals := &gsync.Map[resource.URN, *resource.Goal]{}
 
 	// Create a resource map for the deployment.
-	newResources := &resourceMap{}
+	newResources := &gsync.Map[resource.URN, *resource.State]{}
+
+	reads := &gsync.Map[resource.URN, *resource.State]{}
 
 	// Create a new builtin provider. This provider implements features such as `getStack`.
-	builtins := newBuiltinProvider(backendClient, newResources)
+	builtins := newBuiltinProvider(backendClient, newResources, reads, ctx.Diag)
 
 	// Create a new provider registry. Although we really only need to pass in any providers that were present in the
 	// old resource list, the registry itself will filter out other sorts of resources when processing the prior state,
 	// so we just pass all of the old resources.
-	reg, err := providers.NewRegistry(ctx.Host, oldResources, preview, builtins)
-	if err != nil {
-		return nil, err
-	}
+	reg := providers.NewRegistry(ctx.Host, opts.DryRun, builtins)
 
 	return &Deployment{
 		ctx:                  ctx,
+		opts:                 opts,
+		events:               events,
 		target:               target,
 		prev:                 prev,
+		plan:                 plan,
 		olds:                 olds,
 		source:               source,
 		localPolicyPackPaths: localPolicyPackPaths,
-		preview:              preview,
 		depGraph:             depGraph,
 		providers:            reg,
 		goals:                newGoals,
 		news:                 newResources,
+		newPlans:             newResourcePlan(target.Config),
+		reads:                reads,
 	}, nil
 }
 
@@ -360,31 +519,75 @@ func (d *Deployment) Prev() *Snapshot                        { return d.prev }
 func (d *Deployment) Olds() map[resource.URN]*resource.State { return d.olds }
 func (d *Deployment) Source() Source                         { return d.source }
 
+func (d *Deployment) SameProvider(res *resource.State) error {
+	var ctx context.Context
+	if d.ctx == nil {
+		ctx = context.Background()
+	} else {
+		ctx = d.ctx.Base()
+	}
+	return d.providers.Same(ctx, res)
+}
+
+// EnsureProvider ensures that the provider for the given resource is available in the registry. It assumes
+// the provider is available in the previous snapshot.
+func (d *Deployment) EnsureProvider(provider string) error {
+	if provider == "" {
+		return nil
+	}
+
+	providerRef, err := providers.ParseReference(provider)
+	if err != nil {
+		return fmt.Errorf("invalid provider reference %v: %w", provider, err)
+	}
+	_, has := d.GetProvider(providerRef)
+	if !has {
+		// We need to create the provider in the registry, find its old state and just "Same" it.
+		var providerResource *resource.State
+		for _, r := range d.prev.Resources {
+			if r.URN == providerRef.URN() && r.ID == providerRef.ID() {
+				providerResource = r
+				break
+			}
+		}
+		if providerResource == nil {
+			return fmt.Errorf("could not find provider %v", providerRef)
+		}
+
+		err := d.SameProvider(providerResource)
+		if err != nil {
+			return fmt.Errorf("could not create provider %v: %w", providerRef, err)
+		}
+	}
+
+	return nil
+}
+
 func (d *Deployment) GetProvider(ref providers.Reference) (plugin.Provider, bool) {
 	return d.providers.GetProvider(ref)
 }
 
 // generateURN generates a resource's URN from its parent, type, and name under the scope of the deployment's stack and
 // project.
-func (d *Deployment) generateURN(parent resource.URN, ty tokens.Type, name tokens.QName) resource.URN {
+func (d *Deployment) generateURN(parent resource.URN, ty tokens.Type, name string) resource.URN {
 	// Use the resource goal state name to produce a globally unique URN.
 	parentType := tokens.Type("")
-	if parent != "" && parent.Type() != resource.RootStackType {
+	if parent != "" && parent.QualifiedType() != resource.RootStackType {
 		// Skip empty parents and don't use the root stack type; otherwise, use the full qualified type.
 		parentType = parent.QualifiedType()
 	}
 
-	return resource.NewURN(d.Target().Name, d.source.Project(), parentType, ty, name)
+	return resource.NewURN(d.Target().Name.Q(), d.source.Project(), parentType, ty, name)
 }
 
 // defaultProviderURN generates the URN for the global provider given a package.
 func defaultProviderURN(target *Target, source Source, pkg tokens.Package) resource.URN {
-	return resource.NewURN(target.Name, source.Project(), "", providers.MakeProviderType(pkg), "default")
+	return resource.NewURN(target.Name.Q(), source.Project(), "", providers.MakeProviderType(pkg), "default")
 }
 
 // generateEventURN generates a URN for the resource associated with the given event.
 func (d *Deployment) generateEventURN(event SourceEvent) resource.URN {
-	contract.Require(event != nil, "event != nil")
+	contract.Requiref(event != nil, "event", "must not be nil")
 
 	switch e := event.(type) {
 	case RegisterResourceEvent:
@@ -400,7 +603,7 @@ func (d *Deployment) generateEventURN(event SourceEvent) resource.URN {
 }
 
 // Execute executes a deployment to completion, using the given cancellation context and running a preview or update.
-func (d *Deployment) Execute(ctx context.Context, opts Options, preview bool) result.Result {
+func (d *Deployment) Execute(ctx context.Context) (*Plan, error) {
 	deploymentExec := &deploymentExecutor{deployment: d}
-	return deploymentExec.Execute(ctx, opts, preview)
+	return deploymentExec.Execute(ctx)
 }

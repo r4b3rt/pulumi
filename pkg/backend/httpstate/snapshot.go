@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2022, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,49 +16,104 @@ package httpstate
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 
-	"github.com/pkg/errors"
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	"github.com/pulumi/pulumi/pkg/v3/backend/httpstate/client"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
-	"github.com/pulumi/pulumi/pkg/v3/secrets"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
 )
 
 // cloudSnapshotPersister persists snapshots to the Pulumi service.
 type cloudSnapshotPersister struct {
-	context     context.Context         // The context to use for client requests.
-	update      client.UpdateIdentifier // The UpdateIdentifier for this update sequence.
-	tokenSource *tokenSource            // A token source for interacting with the service.
-	backend     *cloudBackend           // A backend for communicating with the service
-	sm          secrets.Manager
-}
-
-func (persister *cloudSnapshotPersister) SecretsManager() secrets.Manager {
-	return persister.sm
+	context             context.Context         // The context to use for client requests.
+	update              client.UpdateIdentifier // The UpdateIdentifier for this update sequence.
+	tokenSource         tokenSourceCapability   // A token source for interacting with the service.
+	backend             *cloudBackend           // A backend for communicating with the service
+	deploymentDiffState *deploymentDiffState
 }
 
 func (persister *cloudSnapshotPersister) Save(snapshot *deploy.Snapshot) error {
-	token, err := persister.tokenSource.GetToken()
+	ctx := persister.context
+
+	deploymentV3, err := stack.SerializeDeployment(ctx, snapshot, false /* showSecrets */)
+	if err != nil {
+		return fmt.Errorf("serializing deployment: %w", err)
+	}
+
+	// Diff capability can be nil because of feature flagging.
+	if persister.deploymentDiffState == nil {
+		// Continue with how deployments were saved before diff.
+		return persister.backend.client.PatchUpdateCheckpoint(
+			persister.context, persister.update, deploymentV3, persister.tokenSource)
+	}
+
+	differ := persister.deploymentDiffState
+
+	deployment, err := differ.MarshalDeployment(deploymentV3)
 	if err != nil {
 		return err
 	}
-	deployment, err := stack.SerializeDeployment(snapshot, persister.sm, false /* showSecrets */)
-	if err != nil {
-		return errors.Wrap(err, "serializing deployment")
+
+	// If there is no baseline to diff against, or diff is predicted to be inefficient, use saveFull.
+	if !differ.ShouldDiff(deployment) {
+		if err := persister.saveFullVerbatim(ctx, differ, deployment.raw, persister.tokenSource); err != nil {
+			return err
+		}
+	} else { // Otherwise can use saveDiff.
+		diff, err := differ.Diff(ctx, deployment)
+		if err != nil {
+			return err
+		}
+		if err := persister.saveDiff(ctx, diff, persister.tokenSource); err != nil {
+			if logging.V(3) {
+				logging.V(3).Infof("ignoring error saving checkpoint "+
+					"with PatchUpdateCheckpointDelta, falling back to "+
+					"PatchUpdateCheckpoint: %v", err)
+			}
+			if err := persister.saveFullVerbatim(ctx, differ, deployment.raw, persister.tokenSource); err != nil {
+				return err
+			}
+		}
 	}
-	return persister.backend.client.PatchUpdateCheckpoint(persister.context, persister.update, deployment, token)
+
+	return persister.deploymentDiffState.Saved(ctx, deployment)
+}
+
+func (persister *cloudSnapshotPersister) saveDiff(ctx context.Context,
+	diff deploymentDiff, token client.UpdateTokenSource,
+) error {
+	return persister.backend.client.PatchUpdateCheckpointDelta(
+		persister.context, persister.update,
+		diff.sequenceNumber, diff.checkpointHash, diff.deploymentDelta, token)
+}
+
+func (persister *cloudSnapshotPersister) saveFullVerbatim(ctx context.Context,
+	differ *deploymentDiffState, deployment json.RawMessage, token client.UpdateTokenSource,
+) error {
+	return persister.backend.client.PatchUpdateCheckpointVerbatim(
+		persister.context, persister.update, differ.SequenceNumber(),
+		deployment, token)
 }
 
 var _ backend.SnapshotPersister = (*cloudSnapshotPersister)(nil)
 
-func (cb *cloudBackend) newSnapshotPersister(ctx context.Context, update client.UpdateIdentifier,
-	tokenSource *tokenSource, sm secrets.Manager) *cloudSnapshotPersister {
-	return &cloudSnapshotPersister{
+func (b *cloudBackend) newSnapshotPersister(ctx context.Context, update client.UpdateIdentifier,
+	tokenSource tokenSourceCapability,
+) *cloudSnapshotPersister {
+	p := &cloudSnapshotPersister{
 		context:     ctx,
 		update:      update,
 		tokenSource: tokenSource,
-		backend:     cb,
-		sm:          sm,
+		backend:     b,
 	}
+
+	caps := b.capabilities(ctx)
+	deltaCaps := caps.deltaCheckpointUpdates
+	if deltaCaps != nil {
+		p.deploymentDiffState = newDeploymentDiffState(deltaCaps.CheckpointCutoffSizeBytes)
+	}
+	return p
 }

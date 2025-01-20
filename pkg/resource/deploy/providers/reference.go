@@ -15,9 +15,9 @@
 package providers
 
 import (
+	"errors"
+	"fmt"
 	"strings"
-
-	"github.com/pkg/errors"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
@@ -32,6 +32,11 @@ import (
 // performing a preview).
 const UnknownID = plugin.UnknownStringValue
 
+// UnconfiguredID is a distinguished token used to indicate that a provider doesn't yet have an ID because it hasn't
+// been configured yet. This should never be returned back to SDKs by the engine but is used for internal tracking so we
+// maximally reuse provider instances but only configure them once.
+const UnconfiguredID = "unconfigured"
+
 // IsProviderType returns true if the supplied type token refers to a Pulumi provider.
 func IsProviderType(typ tokens.Type) bool {
 	// Tokens without a module member are definitely not provider types.
@@ -43,7 +48,7 @@ func IsProviderType(typ tokens.Type) bool {
 
 // IsDefaultProvider returns true if this URN refers to a default Pulumi provider.
 func IsDefaultProvider(urn resource.URN) bool {
-	return IsProviderType(urn.Type()) && strings.HasPrefix(urn.Name().String(), "default")
+	return IsProviderType(urn.Type()) && strings.HasPrefix(urn.Name(), "default")
 }
 
 // MakeProviderType returns the provider type token for the given package.
@@ -53,17 +58,17 @@ func MakeProviderType(pkg tokens.Package) tokens.Type {
 
 // GetProviderPackage returns the provider package for the given type token.
 func GetProviderPackage(typ tokens.Type) tokens.Package {
-	contract.Require(IsProviderType(typ), "typ")
+	contract.Requiref(IsProviderType(typ), "typ", "must be a provider type token, got %q", typ)
 	return tokens.Package(typ.Name())
 }
 
 func validateURN(urn resource.URN) error {
 	if !urn.IsValid() {
-		return errors.Errorf("%s is not a valid URN", urn)
+		return fmt.Errorf("%s is not a valid URN", urn)
 	}
 	typ := urn.Type()
 	if typ.Module() != "pulumi:providers" {
-		return errors.Errorf("invalid module in type: expected 'pulumi:providers', got '%v'", typ.Module())
+		return fmt.Errorf("invalid module in type: expected 'pulumi:providers', got '%v'", typ.Module())
 	}
 	if typ.Name() == "" {
 		return errors.New("provider URNs must specify a type name")
@@ -96,6 +101,31 @@ func (r Reference) String() string {
 	return string(r.urn) + resource.URNNameDelimiter + string(r.id)
 }
 
+const denyDefaultProviderID resource.ID = "denydefaultprovider"
+
+// DenyDefaultProvider represent a default provider that cannot be created.
+func NewDenyDefaultProvider(name string) Reference {
+	return mustNewReference(
+		resource.NewURN("denied", "denied", "denied", "pulumi:providers:denied", name),
+		denyDefaultProviderID)
+}
+
+// Retrieves the package of the denied provider.
+//
+// For example, if a reference to:
+// "urn:pulumi:stack::project::pulumi:providers:aws::default_4_35_0"
+// was denied, then GetDeniedDefaultProviderPkg would return "aws".
+//
+// Panics if called on a provider that is not a DenyDefaultProvider.
+func GetDeniedDefaultProviderPkg(ref Reference) string {
+	contract.Requiref(IsDenyDefaultsProvider(ref), "ref", "must be a DenyDefaultProvider, got %v", ref)
+	return ref.URN().Name()
+}
+
+func IsDenyDefaultsProvider(ref Reference) bool {
+	return ref.id == denyDefaultProviderID
+}
+
 // NewReference creates a new reference for the given URN and ID.
 func NewReference(urn resource.URN, id resource.ID) (Reference, error) {
 	if err := validateURN(urn); err != nil {
@@ -106,7 +136,7 @@ func NewReference(urn resource.URN, id resource.ID) (Reference, error) {
 
 func mustNewReference(urn resource.URN, id resource.ID) Reference {
 	ref, err := NewReference(urn, id)
-	contract.Assert(err == nil)
+	contract.AssertNoErrorf(err, "could not create reference with URN '%v' and ID '%v'", urn, id)
 	return ref
 }
 
@@ -117,7 +147,7 @@ func ParseReference(s string) (Reference, error) {
 	// of the reference.
 	lastSep := strings.LastIndex(s, resource.URNNameDelimiter)
 	if lastSep == -1 {
-		return Reference{}, errors.Errorf("expected '%v' in provider reference '%v'", resource.URNNameDelimiter, s)
+		return Reference{}, fmt.Errorf("expected '%v' in provider reference '%v'", resource.URNNameDelimiter, s)
 	}
 	urn, id := resource.URN(s[:lastSep]), resource.ID(s[lastSep+len(resource.URNNameDelimiter):])
 	if err := validateURN(urn); err != nil {

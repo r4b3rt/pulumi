@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// nolint: lll
+//nolint:lll
 package dotnet
 
 import (
@@ -25,6 +25,7 @@ import (
 
 var testPackageSpec = schema.PackageSpec{
 	Name:        "aws",
+	Version:     "0.0.1",
 	Description: "A fake provider package used for testing.",
 	Meta: &schema.MetadataSpec{
 		ModuleFormat: "(.*)(?:/[^/]*)",
@@ -67,6 +68,8 @@ func getTestPackage(t *testing.T) *schema.Package {
 }
 
 func TestGetDocLinkForResourceType(t *testing.T) {
+	t.Parallel()
+
 	pkg := getTestPackage(t)
 
 	d := DocLanguageHelper{}
@@ -76,6 +79,8 @@ func TestGetDocLinkForResourceType(t *testing.T) {
 }
 
 func TestGetDocLinkForResourceInputOrOutputType(t *testing.T) {
+	t.Parallel()
+
 	pkg := getTestPackage(t)
 
 	namespaces := map[string]string{

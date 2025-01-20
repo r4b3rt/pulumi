@@ -16,35 +16,56 @@ package deploytest
 
 import (
 	"context"
+	"errors"
+	"io"
 
+	"github.com/hashicorp/hcl/v2"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
+var ErrLanguageRuntimeIsClosed = errors.New("language runtime is shutting down")
+
+type LanguageRuntimeFactory func() plugin.LanguageRuntime
+
 type ProgramFunc func(runInfo plugin.RunInfo, monitor *ResourceMonitor) error
 
-func NewLanguageRuntime(program ProgramFunc, requiredPlugins ...workspace.PluginInfo) plugin.LanguageRuntime {
+func NewLanguageRuntimeF(program ProgramFunc, requiredPackages ...workspace.PackageDescriptor) LanguageRuntimeFactory {
+	return func() plugin.LanguageRuntime {
+		return NewLanguageRuntime(program, requiredPackages...)
+	}
+}
+
+func NewLanguageRuntime(program ProgramFunc, requiredPackages ...workspace.PackageDescriptor) plugin.LanguageRuntime {
 	return &languageRuntime{
-		requiredPlugins: requiredPlugins,
-		program:         program,
+		requiredPackages: requiredPackages,
+		program:          program,
 	}
 }
 
 type languageRuntime struct {
-	requiredPlugins []workspace.PluginInfo
-	program         ProgramFunc
+	requiredPackages []workspace.PackageDescriptor
+	program          ProgramFunc
+	closed           bool
 }
 
 func (p *languageRuntime) Close() error {
+	p.closed = true
 	return nil
 }
 
-func (p *languageRuntime) GetRequiredPlugins(info plugin.ProgInfo) ([]workspace.PluginInfo, error) {
-	return p.requiredPlugins, nil
+func (p *languageRuntime) GetRequiredPackages(info plugin.ProgramInfo) ([]workspace.PackageDescriptor, error) {
+	if p.closed {
+		return nil, ErrLanguageRuntimeIsClosed
+	}
+	return p.requiredPackages, nil
 }
 
 func (p *languageRuntime) Run(info plugin.RunInfo) (string, bool, error) {
+	if p.closed {
+		return "", false, ErrLanguageRuntimeIsClosed
+	}
 	monitor, err := dialMonitor(context.Background(), info.MonitorAddress)
 	if err != nil {
 		return "", false, err
@@ -63,5 +84,62 @@ func (p *languageRuntime) Run(info plugin.RunInfo) (string, bool, error) {
 }
 
 func (p *languageRuntime) GetPluginInfo() (workspace.PluginInfo, error) {
+	if p.closed {
+		return workspace.PluginInfo{}, ErrLanguageRuntimeIsClosed
+	}
 	return workspace.PluginInfo{Name: "TestLanguage"}, nil
+}
+
+func (p *languageRuntime) InstallDependencies(plugin.InstallDependenciesRequest) error {
+	if p.closed {
+		return ErrLanguageRuntimeIsClosed
+	}
+	return nil
+}
+
+func (p *languageRuntime) RuntimeOptionsPrompts(info plugin.ProgramInfo) ([]plugin.RuntimeOptionPrompt, error) {
+	if p.closed {
+		return []plugin.RuntimeOptionPrompt{}, ErrLanguageRuntimeIsClosed
+	}
+	return []plugin.RuntimeOptionPrompt{}, nil
+}
+
+func (p *languageRuntime) About(info plugin.ProgramInfo) (plugin.AboutInfo, error) {
+	if p.closed {
+		return plugin.AboutInfo{}, ErrLanguageRuntimeIsClosed
+	}
+	return plugin.AboutInfo{}, nil
+}
+
+func (p *languageRuntime) GetProgramDependencies(
+	info plugin.ProgramInfo, transitiveDependencies bool,
+) ([]plugin.DependencyInfo, error) {
+	if p.closed {
+		return nil, ErrLanguageRuntimeIsClosed
+	}
+	return nil, nil
+}
+
+func (p *languageRuntime) RunPlugin(info plugin.RunPluginInfo) (io.Reader, io.Reader, context.CancelFunc, error) {
+	return nil, nil, nil, errors.New("inline plugins are not currently supported")
+}
+
+func (p *languageRuntime) GenerateProject(string, string, string,
+	bool, string, map[string]string,
+) (hcl.Diagnostics, error) {
+	return nil, errors.New("GenerateProject is not supported")
+}
+
+func (p *languageRuntime) GeneratePackage(
+	string, string, map[string][]byte, string, map[string]string, bool,
+) (hcl.Diagnostics, error) {
+	return nil, errors.New("GeneratePackage is not supported")
+}
+
+func (p *languageRuntime) GenerateProgram(map[string]string, string, bool) (map[string][]byte, hcl.Diagnostics, error) {
+	return nil, nil, errors.New("GenerateProgram is not supported")
+}
+
+func (p *languageRuntime) Pack(string, string) (string, error) {
+	return "", errors.New("Pack is not supported")
 }

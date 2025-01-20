@@ -73,10 +73,17 @@ func TargetDependents() Option {
 	})
 }
 
-// ProgressStreams allows specifying one or more io.Writers to redirect incremental update output
+// ProgressStreams allows specifying one or more io.Writers to redirect incremental update stdout
 func ProgressStreams(writers ...io.Writer) Option {
 	return optionFunc(func(opts *Options) {
 		opts.ProgressStreams = writers
+	})
+}
+
+// ErrorProgressStreams allows specifying one or more io.Writers to redirect incremental update stderr
+func ErrorProgressStreams(writers ...io.Writer) Option {
+	return optionFunc(func(opts *Options) {
+		opts.ErrorProgressStreams = writers
 	})
 }
 
@@ -98,6 +105,69 @@ func EventStreams(channels ...chan<- events.EngineEvent) Option {
 func UserAgent(agent string) Option {
 	return optionFunc(func(opts *Options) {
 		opts.UserAgent = agent
+	})
+}
+
+// Color allows specifying whether to colorize output. Choices are: always, never, raw, auto (default "auto")
+func Color(color string) Option {
+	return optionFunc(func(opts *Options) {
+		opts.Color = color
+	})
+}
+
+// Plan specifies the path to an update plan to use for the update.
+func Plan(path string) Option {
+	return optionFunc(func(opts *Options) {
+		opts.Plan = path
+	})
+}
+
+// ShowSecrets configures whether to show config secrets when they appear.
+func ShowSecrets(show bool) Option {
+	return optionFunc(func(opts *Options) {
+		opts.ShowSecrets = &show
+	})
+}
+
+// Suppress display of periodic progress dots
+func SuppressProgress() Option {
+	return optionFunc(func(opts *Options) {
+		opts.SuppressProgress = true
+	})
+}
+
+// Suppress display of stack outputs (in case they contain sensitive values)
+func SuppressOutputs() Option {
+	return optionFunc(func(opts *Options) {
+		opts.SuppressOutputs = true
+	})
+}
+
+// Refresh will refresh the stack's state before the update.
+func Refresh() Option {
+	return optionFunc(func(opts *Options) {
+		opts.Refresh = true
+	})
+}
+
+// ContinueOnError will continue to perform the update operation despite the occurrence of errors.
+func ContinueOnError() Option {
+	return optionFunc(func(opts *Options) {
+		opts.ContinueOnError = true
+	})
+}
+
+// AttachDebugger will run the process under a debugger, and pause until a debugger is attached
+func AttachDebugger() Option {
+	return optionFunc(func(opts *Options) {
+		opts.AttachDebugger = true
+	})
+}
+
+// ConfigFile specifies a file to use for configuration values rather than detecting the file name
+func ConfigFile(path string) Option {
+	return optionFunc(func(opts *Options) {
+		opts.ConfigFile = path
 	})
 }
 
@@ -127,12 +197,36 @@ type Options struct {
 	TargetDependents bool
 	// DebugLogOpts specifies additional settings for debug logging
 	DebugLogOpts debug.LoggingOptions
-	// ProgressStreams allows specifying one or more io.Writers to redirect incremental update output
+	// ProgressStreams allows specifying one or more io.Writers to redirect incremental update stdout
 	ProgressStreams []io.Writer
+	// ErrorProgressStreams allows specifying one or more io.Writers to redirect incremental update stderr
+	ErrorProgressStreams []io.Writer
 	// EventStreams allows specifying one or more channels to receive the Pulumi event stream
 	EventStreams []chan<- events.EngineEvent
 	// UserAgent specifies the agent responsible for the update, stored in backends as "environment.exec.agent"
 	UserAgent string
+	// Colorize output. Choices are: always, never, raw, auto (default "auto")
+	Color string
+	// Use the update plan at the given path.
+	Plan string
+	// Run one or more policy packs as part of this update
+	PolicyPacks []string
+	// Path to JSON file containing the config for the policy pack of the corresponding "--policy-pack" flag
+	PolicyPackConfigs []string
+	// Show config secrets when they appear.
+	ShowSecrets *bool
+	// Refresh will refresh the stack's state before the update.
+	Refresh bool
+	// Suppress display of periodic progress dots
+	SuppressProgress bool
+	// Suppress display of stack outputs (in case they contain sensitive values)
+	SuppressOutputs bool
+	// ContinueOnError will continue to perform the update operation despite the occurrence of errors.
+	ContinueOnError bool
+	// AttachDebugger will run the process under a debugger, and pause until a debugger is attached
+	AttachDebugger bool
+	// Run using the configuration values in the specified file rather than detecting the file name
+	ConfigFile string
 }
 
 type optionFunc func(*Options)

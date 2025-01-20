@@ -15,7 +15,6 @@
 package client
 
 import (
-	"fmt"
 	"net/http"
 	"net/url"
 	"path"
@@ -62,13 +61,13 @@ func getEndpointName(method, path string) string {
 		return "unknown"
 	}
 
-	return fmt.Sprintf("api/%s", match.Route.GetName())
+	return "api/" + match.Route.GetName()
 }
 
 // routes is the canonical muxer we use to determine friendly names for Pulumi APIs.
 var routes *mux.Router
 
-// nolint: lll
+//nolint:lll
 func init() {
 	routes = mux.NewRouter()
 
@@ -77,6 +76,8 @@ func init() {
 	addEndpoint := func(method, path, name string) {
 		routes.Path(path).Methods(method).Name(name)
 	}
+
+	addEndpoint("GET", "/api/capabilities", "getCapabilities")
 
 	addEndpoint("GET", "/api/user", "getCurrentUser")
 	addEndpoint("GET", "/api/user/stacks", "listUserStacks")
@@ -94,6 +95,7 @@ func init() {
 	addEndpoint("GET", "/api/stacks/{orgName}/{projectName}/{stackName}/updates/{version}", "getStackUpdate")
 	addEndpoint("GET", "/api/stacks/{orgName}/{projectName}/{stackName}/updates/{version}/contents/files", "getUpdateContentsFiles")
 	addEndpoint("GET", "/api/stacks/{orgName}/{projectName}/{stackName}/updates/{version}/contents/file/{path:.*}", "getUpdateContentsFilePath")
+	addEndpoint("POST", "/api/stacks/{orgName}/{projectName}/{stackName}/batch-decrypt", "batchDecrypt")
 
 	// The APIs for performing updates of various kind all have the same set of API endpoints. Only
 	// differentiate the "create update of kind X" APIs, and introduce a pseudo route param "updateKind".
@@ -104,6 +106,8 @@ func init() {
 	addEndpoint("GET", "/api/stacks/{orgName}/{projectName}/{stackName}/{updateKind}/{updateID}", "getUpdateStatus")
 	addEndpoint("POST", "/api/stacks/{orgName}/{projectName}/{stackName}/{updateKind}/{updateID}", "startUpdate")
 	addEndpoint("PATCH", "/api/stacks/{orgName}/{projectName}/{stackName}/{updateKind}/{updateID}/checkpoint", "patchCheckpoint")
+	addEndpoint("PATCH", "/api/stacks/{orgName}/{projectName}/{stackName}/{updateKind}/{updateID}/checkpointdelta", "patchCheckpointDelta")
+	addEndpoint("PATCH", "/api/stacks/{orgName}/{projectName}/{stackName}/{updateKind}/{updateID}/checkpointverbatim", "patchCheckpointVerbatim")
 	addEndpoint("POST", "/api/stacks/{orgName}/{projectName}/{stackName}/{updateKind}/{updateID}/complete", "completeUpdate")
 	addEndpoint("POST", "/api/stacks/{orgName}/{projectName}/{stackName}/{updateKind}/{updateID}/events", "postEngineEvent")
 	addEndpoint("POST", "/api/stacks/{orgName}/{projectName}/{stackName}/{updateKind}/{updateID}/events/batch", "postEngineEventBatch")
@@ -111,4 +115,8 @@ func init() {
 
 	// APIs for managing `PolicyPack`s.
 	addEndpoint("POST", "/api/orgs/{orgName}/policypacks", "publishPolicyPack")
+
+	// APIs for managing Search capabilities
+	addEndpoint("GET", "/api/orgs/{orgName}/search/resources", "getSearchResources")
+	addEndpoint("GET", "/api/orgs/{orgName}/search/resources/parse", "getSearchResourcesParse")
 }

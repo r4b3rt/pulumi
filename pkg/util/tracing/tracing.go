@@ -14,10 +14,14 @@
 
 package tracing
 
-import "context"
+import (
+	"context"
+)
+
+type key int
 
 // tracingOptionsKey is the value used as the context key for TracingOptions.
-var tracingOptionsKey struct{}
+const tracingOptionsKey key = 0
 
 // TracingOptions describes the set of options available for configuring tracing on a per-request basis.
 type Options struct {

@@ -14,8 +14,11 @@
 import asyncio
 import sys
 import traceback
-from typing import Callable, Awaitable, Tuple, Any, Optional, List
+from typing import Any, Awaitable, Callable, List, Optional, Tuple, TypeVar
+
 from .. import log
+
+T = TypeVar("T")
 
 
 class RPCManager:
@@ -42,11 +45,11 @@ class RPCManager:
     """
 
     def __init__(self):
-        self.rpcs = []
-        self.unhandled_exception = None
-        self.exception_traceback = None
+        self.clear()
 
-    def do_rpc(self, name: str, rpc_function: Callable[..., Awaitable[Tuple[Any, Exception]]]) -> Callable[..., Awaitable[Tuple[Any, Exception]]]:
+    def do_rpc(
+        self, name: str, rpc_function: Callable[..., Awaitable[T]]
+    ) -> Callable[..., Awaitable[Tuple[T, Exception]]]:
         """
         Wraps a given RPC function by producing an awaitable function suitable to be run in the asyncio
         event loop. The wrapped function catches all unhandled exceptions and reports them to the exception
@@ -58,6 +61,7 @@ class RPCManager:
         :param rpc_function: The function implementing the RPC
         :return: An awaitable function implementing the RPC
         """
+
         async def rpc_wrapper(*args, **kwargs):
             log.debug(f"beginning rpc {name}")
 
@@ -66,7 +70,7 @@ class RPCManager:
             try:
                 result = await rpc
                 exception = None
-            except Exception as exn:
+            except Exception as exn:  # noqa: BLE001 catch blind exception
                 log.debug("RPC failed with exception:")
                 log.debug(traceback.format_exc())
                 if self.unhandled_exception is None:
@@ -79,8 +83,8 @@ class RPCManager:
 
         return rpc_wrapper
 
-
-RPC_MANAGER: RPCManager = RPCManager()
-"""
-Singleton RPC manager responsible for coordinating RPC calls to the engine.
-"""
+    def clear(self) -> None:
+        """Clears any tracked state."""
+        self.rpcs = []
+        self.exception_traceback = None
+        self.unhandled_exception = None

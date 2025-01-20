@@ -1,72 +1,126 @@
 PROJECT_NAME     := Pulumi Node.JS SDK
 NODE_MODULE_NAME := @pulumi/pulumi
-VERSION 		 := $(shell cd ../../ && pulumictl get version --language javascript)
+VERSION          := $(if ${PULUMI_VERSION},${PULUMI_VERSION},$(shell ../../scripts/pulumi-version.sh javascript))
 
-LANGUAGE_HOST    := github.com/pulumi/pulumi/sdk/v3/nodejs/cmd/pulumi-language-nodejs
+LANGHOST_PKG    := github.com/pulumi/pulumi/sdk/nodejs/cmd/pulumi-language-nodejs/v3
 
-PROJECT_PKGS    := $(shell go list ./cmd...)
-TESTPARALLELISM := 10
 TEST_FAST_TIMEOUT := 2m
+
+ifeq ($(DEBUG),"true")
+$(info    VERSION         = $(VERSION))
+endif
+
+# Motivation: running `make TEST_ALL_DEPS= test_all` permits running
+# `test_all` without the dependencies.
+TEST_ALL_DEPS ?= build
 
 include ../../build/common.mk
 
 export PATH:=$(shell yarn bin 2>/dev/null):$(PATH)
 
-lint::
-	./node_modules/.bin/tslint -c tslint.json -p tsconfig.json
+ensure:: yarn.ensure node.ensure .ensure.phony
+.ensure.phony: package.json
+	yarn install --frozen-lockfile
+	@touch .ensure.phony
 
-build_package::
-	./node_modules/.bin/tsc
-	cp tests/runtime/jsClosureCases_8.js bin/tests/runtime
-	cp tests/runtime/jsClosureCases_10_4.js bin/tests/runtime
+format:: ensure
+	yarn biome format --write .
+
+lint:: ensure
+	yarn run eslint -c .eslintrc.js --ext .ts .
+	yarn biome ci .
+
+lint_fix:: ensure
+	yarn run eslint -c .eslintrc.js --ext .ts --fix .
+	yarn biome format --write .
+
+build_package:: ensure
+	yarn run tsc
+	mkdir -p bin/tests/automation/data/
 	cp -R tests/automation/data/. bin/tests/automation/data/
-	cp README.md ../../LICENSE package.json ./dist/* bin/
+	cp .npmignore README.md ../../LICENSE ./dist/* bin/
+	cp -R ./vendor/ ./bin/vendor/
 	node ../../scripts/reversion.js bin/package.json ${VERSION}
 	node ../../scripts/reversion.js bin/version.js ${VERSION}
+	mkdir -p bin/proto
 	cp -R proto/. bin/proto/
 	mkdir -p bin/tests/runtime/langhost/cases/
 	find tests/runtime/langhost/cases/* -type d -exec cp -R {} bin/tests/runtime/langhost/cases/ \;
 
 build_plugin::
-	go install -ldflags "-X github.com/pulumi/pulumi/sdk/v3/go/common/version.Version=${VERSION}" ${LANGUAGE_HOST}
+	cd cmd/pulumi-language-nodejs && \
+	go install -ldflags "-X github.com/pulumi/pulumi/sdk/v3/go/common/version.Version=${VERSION}" ${LANGHOST_PKG}
 
 build:: build_package build_plugin
 
 install_package:: build
-	cp dist/pulumi-resource-pulumi-nodejs "$(PULUMI_BIN)"
-	cp dist/pulumi-analyzer-policy "$(PULUMI_BIN)"
+	cp dist/pulumi-resource-pulumi-nodejs* "$(PULUMI_BIN)"
+	cp dist/pulumi-analyzer-policy* "$(PULUMI_BIN)"
 
 install_plugin:: build
-	GOBIN=$(PULUMI_BIN) go install -ldflags "-X github.com/pulumi/pulumi/sdk/v3/go/common/version.Version=${VERSION}" ${LANGUAGE_HOST}
+	cd cmd/pulumi-language-nodejs && \
+	GOBIN=$(PULUMI_BIN) go install -ldflags "-X github.com/pulumi/pulumi/sdk/v3/go/common/version.Version=${VERSION}" ${LANGHOST_PKG}
 
 install:: install_package install_plugin
 
-istanbul_tests:: build
-	./node_modules/.bin/istanbul test --print none _mocha -- --timeout 120000 'bin/tests/**/*.spec.js'
-	./node_modules/.bin/istanbul report text-summary
-	./node_modules/.bin/istanbul report text
-	./node_modules/.bin/istanbul test --print none _mocha -- 'bin/tests_with_mocks/**/*.spec.js'
+unit_tests:: $(TEST_ALL_DEPS)
+	yarn run nyc -s mocha --timeout 120000 \
+		--exclude 'bin/tests/automation/**/*.spec.js' \
+		--exclude 'bin/tests/runtime/closure-integration-tests.js' \
+		'bin/tests/**/*.spec.js'
+	yarn run nyc -s mocha 'bin/tests_with_mocks/**/*.spec.js'
 
-sxs_tests:: build
-	pushd tests/sxs_ts_3.6 && yarn ; tsc ; popd
-	pushd tests/sxs_ts_latest && yarn ; tsc ; popd
+test_auto:: $(TEST_ALL_DEPS)
+	yarn run nyc -s mocha --timeout 300000 'bin/tests/automation/**/*.spec.js'
 
-test_fast:: sxs_tests istanbul_tests
-	$(GO_TEST_FAST) ${PROJECT_PKGS}
+test_integration:: $(TEST_ALL_DEPS)
+	node 'bin/tests/runtime/closure-integration-tests.js'
+	node 'bin/tests/runtime/install-package-tests.js'
 
-test_all:: sxs_tests istanbul_tests
-	$(GO_TEST) ${PROJECT_PKGS}
+TSC_SUPPORTED_VERSIONS = ~3.8.3 ^3 ^4
+
+version=$(subst sxs_test_,,$(word 1,$(subst !, ,$@)))
+sxs_test_%:
+	@cd tests/sxs_ts_test && ( \
+		cp -f package$(version).json package.json && \
+		yarn install && \
+		yarn run tsc --version && \
+		yarn run tsc &&  \
+		rm package.json && \
+		echo "✅ TypeScript $(version) passed" \
+	) || ( \
+		echo "🚫 TypeScript $(version) failed"; \
+		exit 1; \
+	)
+
+sxs_tests:: $(TSC_SUPPORTED_VERSIONS:%=sxs_test_%)
+
+test_fast:: sxs_tests unit_tests
+ifneq ($(PULUMI_TEST_COVERAGE_PATH),)
+	if [ -e .nyc_output ]; then yarn run nyc report -r cobertura --report-dir $(PULUMI_TEST_COVERAGE_PATH); fi
+endif
+	@cd cmd/pulumi-language-nodejs && $(GO_TEST_FAST) $(shell go list ./... | grep -v /vendor/ | grep -v templates)
+	$(GO_TEST_FAST) $(shell go list ./...)
+
+test_go:: $(TEST_ALL_DEPS)
+	@cd cmd/pulumi-language-nodejs && $(GO_TEST) $(shell go list ./... | grep -v /vendor/ | grep -v templates)
+	$(GO_TEST) $(shell go list ./...)
+
+test_all:: sxs_tests unit_tests test_auto test_go test_integration
+ifneq ($(PULUMI_TEST_COVERAGE_PATH),)
+	if [ -e .nyc_output ]; then yarn run nyc report -r cobertura --report-dir $(PULUMI_TEST_COVERAGE_PATH); fi
+endif
 
 dist:: build
-	go install -ldflags "-X github.com/pulumi/pulumi/sdk/v3/go/common/version.Version=${VERSION}" ${LANGUAGE_HOST}
 	cp dist/pulumi-resource-pulumi-nodejs "$$(go env GOPATH)"/bin/
 	cp dist/pulumi-analyzer-policy "$$(go env GOPATH)"/bin/
 
 brew:: BREW_VERSION := $(shell ../../scripts/get-version HEAD)
 brew::
-	go install -ldflags "-X github.com/pulumi/pulumi/sdk/v3/go/common/version.Version=${VERSION}" ${LANGUAGE_HOST}
+	cd cmd/pulumi-language-nodejs && \
+	go install -ldflags "-X github.com/pulumi/pulumi/sdk/v3/go/common/version.Version=${VERSION}" ${LANGHOST_PKG}
 	cp dist/pulumi-resource-pulumi-nodejs "$$(go env GOPATH)"/bin/
 	cp dist/pulumi-analyzer-policy "$$(go env GOPATH)"/bin/
 
-publish:: build_package
+publish::
 	bash -c ../../scripts/publish_npm.sh

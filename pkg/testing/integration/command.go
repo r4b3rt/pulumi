@@ -26,9 +26,21 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 )
 
-// RunCommand executes the specified command and additional arguments, wrapping any output in the
-// specialized test output streams that list the location the test is running in.
 func RunCommand(t *testing.T, name string, args []string, wd string, opts *ProgramTestOptions) error {
+	return RunCommandPulumiHome(t, name, args, wd, opts, "")
+}
+
+// RunCommandPulumiHome executes the specified command and additional arguments, wrapping any output in the
+// specialized test output streams that list the location the test is running in, and sets the PULUMI_HOME
+// environment variable.
+func RunCommandPulumiHome(
+	t *testing.T,
+	name string,
+	args []string,
+	wd string,
+	opts *ProgramTestOptions,
+	pulumiHome string,
+) error {
 	path := args[0]
 	command := strings.Join(args, " ")
 	t.Logf("**** Invoke '%v' in '%v'", command, wd)
@@ -40,6 +52,9 @@ func RunCommand(t *testing.T, name string, args []string, wd string, opts *Progr
 	env = append(env, "PULUMI_DEBUG_COMMANDS=true")
 	env = append(env, "PULUMI_RETAIN_CHECKPOINTS=true")
 	env = append(env, "PULUMI_CONFIG_PASSPHRASE=correct horse battery staple")
+	if pulumiHome != "" {
+		env = append(env, "PULUMI_HOME="+pulumiHome)
+	}
 
 	cmd := exec.Cmd{
 		Path: path,
@@ -83,9 +98,15 @@ func RunCommand(t *testing.T, name string, args []string, wd string, opts *Progr
 		t.Logf("Invoke '%v' failed: %s\n", command, cmdutil.DetailedError(runerr))
 
 		if !opts.Verbose {
+			stderr := opts.Stderr
+
+			if stderr == nil {
+				stderr = os.Stderr
+			}
+
 			// Make sure we write the output in case of a failure to stderr so
 			// tests can assert the shape of the error message.
-			_, _ = fmt.Fprintf(opts.Stderr, "%s\n", string(runout))
+			_, _ = fmt.Fprintf(stderr, "%s\n", string(runout))
 		}
 	}
 

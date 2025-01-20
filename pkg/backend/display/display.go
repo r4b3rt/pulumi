@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2024, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,51 +21,122 @@ import (
 	"os"
 	"time"
 
+	"github.com/pulumi/pulumi/pkg/v3/backend/display/internal/terminal"
+	"github.com/pulumi/pulumi/pkg/v3/channel"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
 )
+
+// printPermalinkNonInteractive prints an update's permalink prefaced with `View Live: `.
+// This message is printed in non-interactive scenarios.
+// In order to maintain backwards compatibility with older versions of the Automation API,
+// the message is not changed for non-interactive scenarios.
+func printPermalinkNonInteractive(out io.Writer, opts Options, permalink string) {
+	printPermalink(out, opts, "View Live", permalink)
+}
+
+// printPermalinkInteractive prints an update's permalink prefaced with `View in Browser (Ctrl+O): `.
+// This is printed in interactive scenarios that use the tree renderer.
+func printPermalinkInteractive(term terminal.Terminal, opts Options, permalink string) {
+	printPermalink(term, opts, "View in Browser (Ctrl+O)", permalink)
+}
+
+func printPermalink(out io.Writer, opts Options, message, permalink string) {
+	if !opts.SuppressPermalink && permalink != "" {
+		// Print a URL at the beginning of the update pointing to the Pulumi Service.
+		headline := colors.SpecHeadline + message + ": " + colors.Underline + colors.BrightBlue + permalink +
+			colors.Reset + "\n\n"
+		fmt.Fprint(out, opts.Color.Colorize(headline))
+	}
+}
 
 // ShowEvents reads events from the `events` channel until it is closed, displaying each event as
 // it comes in. Once all events have been read from the channel and displayed, it closes the `done`
 // channel so the caller can await all the events being written.
 func ShowEvents(
-	op string, action apitype.UpdateKind, stack tokens.QName, proj tokens.PackageName,
-	events <-chan engine.Event, done chan<- bool, opts Options, isPreview bool) {
-
+	op string, action apitype.UpdateKind, stack tokens.StackName, proj tokens.PackageName,
+	permalink string, events <-chan engine.Event, done chan<- bool, opts Options, isPreview bool,
+) {
 	if opts.EventLogPath != "" {
-		events, done = startEventLogger(events, done, opts.EventLogPath)
+		events, done = startEventLogger(events, done, opts)
 	}
 
+	// Need to filter the engine events here to exclude any internal events.
+	events = channel.FilterRead(events, func(e engine.Event) bool {
+		return !e.Internal()
+	})
+
+	streamPreview := cmdutil.IsTruthy(os.Getenv("PULUMI_ENABLE_STREAMING_JSON_PREVIEW"))
+
 	if opts.JSONDisplay {
-		// TODO[pulumi/pulumi#2390]: enable JSON display for real deployments.
-		contract.Assertf(isPreview, "JSON display only available in preview mode")
-		ShowJSONEvents(op, action, events, done, opts)
+		if isPreview && !streamPreview {
+			ShowPreviewDigest(events, done, opts)
+		} else {
+			ShowJSONEvents(events, done, opts)
+		}
 		return
+	}
+
+	if opts.Type != DisplayProgress {
+		printPermalinkNonInteractive(os.Stdout, opts, permalink)
 	}
 
 	switch opts.Type {
 	case DisplayDiff:
-		ShowDiffEvents(op, action, events, done, opts)
+		ShowDiffEvents(op, events, done, opts)
 	case DisplayProgress:
-		ShowProgressEvents(op, action, stack, proj, events, done, opts, isPreview)
+		ShowProgressEvents(op, action, stack, proj, permalink, events, done, opts, isPreview)
 	case DisplayQuery:
 		contract.Failf("DisplayQuery can only be used in query mode, which should be invoked " +
 			"directly instead of through ShowEvents")
 	case DisplayWatch:
-		ShowWatchEvents(op, action, events, done, opts)
+		ShowWatchEvents(op, events, done, opts)
 	default:
 		contract.Failf("Unknown display type %d", opts.Type)
 	}
 }
 
-func startEventLogger(events <-chan engine.Event, done chan<- bool, path string) (<-chan engine.Event, chan<- bool) {
+func logJSONEvent(encoder *json.Encoder, event engine.Event, opts Options, seq int) error {
+	apiEvent, err := ConvertEngineEvent(event, false /* showSecrets */)
+	if err != nil {
+		return err
+	}
+
+	apiEvent.Sequence = seq
+	apiEvent.Timestamp = int(time.Now().Unix())
+	// If opts.Color == "never" (i.e. NO_COLOR is specified or --color=never), clean up the color directives
+	// from the emitted events.
+	if opts.Color == colors.Never {
+		switch {
+		case apiEvent.DiagnosticEvent != nil:
+			apiEvent.DiagnosticEvent.Message = colors.Never.Colorize(apiEvent.DiagnosticEvent.Message)
+			apiEvent.DiagnosticEvent.Prefix = colors.Never.Colorize(apiEvent.DiagnosticEvent.Prefix)
+			apiEvent.DiagnosticEvent.Color = string(colors.Never)
+		case apiEvent.StdoutEvent != nil:
+			apiEvent.StdoutEvent.Message = colors.Never.Colorize(apiEvent.StdoutEvent.Message)
+			apiEvent.StdoutEvent.Color = string(colors.Never)
+		case apiEvent.PolicyEvent != nil:
+			apiEvent.PolicyEvent.Message = colors.Never.Colorize(apiEvent.PolicyEvent.Message)
+			apiEvent.PolicyEvent.Color = string(colors.Never)
+		}
+	}
+
+	return encoder.Encode(apiEvent)
+}
+
+func startEventLogger(events <-chan engine.Event, done chan<- bool, opts Options) (<-chan engine.Event, chan<- bool) {
 	// Before moving further, attempt to open the log file.
-	logFile, err := os.Create(path)
+	//
+	// Try setting O_APPEND to see if that helps with the malformed reads we've been seeing in automation api:
+	// https://github.com/pulumi/pulumi/issues/6768
+	logFile, err := os.OpenFile(opts.EventLogPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND, 0o666)
 	if err != nil {
 		logging.V(7).Infof("could not create event log: %v", err)
 		return events, done
@@ -80,20 +151,12 @@ func startEventLogger(events <-chan engine.Event, done chan<- bool, path string)
 
 		sequence := 0
 		encoder := json.NewEncoder(logFile)
-		logEvent := func(e engine.Event) error {
-			apiEvent, err := ConvertEngineEvent(e)
-			if err != nil {
-				return err
-			}
-			apiEvent.Sequence, sequence = sequence, sequence+1
-			apiEvent.Timestamp = int(time.Now().Unix())
-			return encoder.Encode(apiEvent)
-		}
-
+		encoder.SetEscapeHTML(false)
 		for e := range events {
-			if err = logEvent(e); err != nil {
+			if err = logJSONEvent(encoder, e, opts, sequence); err != nil {
 				logging.V(7).Infof("failed to log event: %v", err)
 			}
+			sequence++
 
 			outEvents <- e
 
@@ -108,8 +171,7 @@ func startEventLogger(events <-chan engine.Event, done chan<- bool, path string)
 	return outEvents, outDone
 }
 
-type nopSpinner struct {
-}
+type nopSpinner struct{}
 
 func (s *nopSpinner) Tick() {
 }
@@ -123,7 +185,7 @@ func isRootStack(step engine.StepEventMetadata) bool {
 }
 
 func isRootURN(urn resource.URN) bool {
-	return urn != "" && urn.Type() == resource.RootStackType
+	return urn != "" && urn.QualifiedType() == resource.RootStackType
 }
 
 // shouldShow returns true if a step should show in the output.
@@ -137,19 +199,16 @@ func shouldShow(step engine.StepEventMetadata, opts Options) bool {
 		return opts.ShowSameResources
 	}
 
-	// For logical replacement operations, only show them during progress-style updates (since this is integrated
+	// For non-logical replacement operations, only show them during progress-style updates (since this is integrated
 	// into the resource status update), or if it is requested explicitly (for diffs and JSON outputs).
-	if (opts.Type == DisplayDiff || opts.JSONDisplay) && !step.Logical && !opts.ShowReplacementSteps {
-		return false
+	if !opts.ShowReplacementSteps {
+		if (opts.Type == DisplayDiff || opts.JSONDisplay) && !step.Logical && deploy.IsReplacementStep(step.Op) {
+			return false
+		}
 	}
 
 	// Otherwise, default to showing the operation.
 	return true
-}
-
-func fprintfIgnoreError(w io.Writer, format string, a ...interface{}) {
-	_, err := fmt.Fprintf(w, format, a...)
-	contract.IgnoreError(err)
 }
 
 func fprintIgnoreError(w io.Writer, a ...interface{}) {

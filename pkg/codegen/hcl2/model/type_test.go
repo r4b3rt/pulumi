@@ -19,6 +19,7 @@ import (
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/zclconf/go-cty/cty"
 )
 
@@ -33,6 +34,8 @@ func testTraverse(t *testing.T, receiver Traversable, traverser hcl.Traverser, e
 }
 
 func TestDynamicType(t *testing.T) {
+	t.Parallel()
+
 	// Test that DynamicType is assignable to and from itself.
 	assert.True(t, DynamicType.AssignableFrom(DynamicType))
 
@@ -117,6 +120,8 @@ func TestDynamicType(t *testing.T) {
 }
 
 func TestOptionalType(t *testing.T) {
+	t.Parallel()
+
 	typ := NewOptionalType(DynamicType)
 
 	// Test that creating an optional type with the same element type does not create a new type.
@@ -151,6 +156,8 @@ func TestOptionalType(t *testing.T) {
 }
 
 func TestOutputType(t *testing.T) {
+	t.Parallel()
+
 	typ := NewOutputType(DynamicType)
 
 	// Test that creating an output type with the same element type does not create a new type.
@@ -226,6 +233,8 @@ func TestOutputType(t *testing.T) {
 }
 
 func TestPromiseType(t *testing.T) {
+	t.Parallel()
+
 	typ := NewPromiseType(DynamicType)
 
 	// Test that creating an promise type with the same element type does not create a new type.
@@ -295,6 +304,8 @@ func TestPromiseType(t *testing.T) {
 }
 
 func TestMapType(t *testing.T) {
+	t.Parallel()
+
 	typ := NewMapType(DynamicType)
 
 	// Test that creating an map type with the same element type does not create a new type.
@@ -332,6 +343,8 @@ func TestMapType(t *testing.T) {
 }
 
 func TestListType(t *testing.T) {
+	t.Parallel()
+
 	typ := NewListType(DynamicType)
 
 	// Test that creating an list type with the same element type does not create a new type.
@@ -362,6 +375,8 @@ func TestListType(t *testing.T) {
 }
 
 func TestSetType(t *testing.T) {
+	t.Parallel()
+
 	typ := NewSetType(DynamicType)
 
 	// Test that creating an set type with the same element type does not create a new type.
@@ -388,6 +403,8 @@ func TestSetType(t *testing.T) {
 }
 
 func TestUnionType(t *testing.T) {
+	t.Parallel()
+
 	typ := NewUnionType(BoolType, IntType, NumberType, StringType).(*UnionType)
 
 	// Test that creating a union with the same element types does not create a new type.
@@ -436,6 +453,8 @@ func TestUnionType(t *testing.T) {
 }
 
 func TestObjectType(t *testing.T) {
+	t.Parallel()
+
 	typ := NewObjectType(map[string]Type{
 		"foo": BoolType,
 		"bar": IntType,
@@ -490,6 +509,8 @@ func TestObjectType(t *testing.T) {
 	testTraverse(t, typ, hcl.TraverseAttr{Name: "bar"}, IntType, false)
 	testTraverse(t, typ, hcl.TraverseAttr{Name: "baz"}, NumberType, false)
 	testTraverse(t, typ, hcl.TraverseAttr{Name: "qux"}, NewOptionalType(BoolType), false)
+	// test case-insensitive attribute
+	testTraverse(t, typ, hcl.TraverseAttr{Name: "Qux"}, NewOptionalType(BoolType), true)
 	testTraverse(t, typ, hcl.TraverseIndex{Key: cty.StringVal("foo")}, BoolType, false)
 	testTraverse(t, typ, hcl.TraverseIndex{Key: cty.StringVal("bar")}, IntType, false)
 	testTraverse(t, typ, hcl.TraverseIndex{Key: cty.StringVal("baz")}, NumberType, false)
@@ -504,31 +525,9 @@ func TestObjectType(t *testing.T) {
 	testTraverse(t, typ, hcl.TraverseIndex{Key: encapsulateType(typ)}, DynamicType, true)
 }
 
-func TestOpaqueType(t *testing.T) {
-	foo, err := NewOpaqueType("foo")
-	assert.NotNil(t, foo)
-	assert.NoError(t, err)
-
-	foo2, ok := GetOpaqueType("foo")
-	assert.EqualValues(t, foo, foo2)
-	assert.True(t, ok)
-
-	foo3, err := NewOpaqueType("foo")
-	assert.Nil(t, foo3)
-	assert.Error(t, err)
-
-	bar, ok := GetOpaqueType("bar")
-	assert.Nil(t, bar)
-	assert.False(t, ok)
-
-	bar, err = NewOpaqueType("bar")
-	assert.NotNil(t, bar)
-	assert.NoError(t, err)
-
-	assert.NotEqual(t, foo, bar)
-}
-
 func TestInputType(t *testing.T) {
+	t.Parallel()
+
 	// Test that InputType(DynamicType) just returns DynamicType.
 	assert.Equal(t, DynamicType, InputType(DynamicType))
 
@@ -583,6 +582,8 @@ func assertUnified(t *testing.T, expectedSafe, expectedUnsafe Type, types ...Typ
 }
 
 func TestUnifyType(t *testing.T) {
+	t.Parallel()
+
 	// Number, int, and bool unify with string by preferring string.
 	assertUnified(t, StringType, StringType, NumberType, StringType)
 	assertUnified(t, StringType, StringType, IntType, StringType)
@@ -668,6 +669,8 @@ func TestUnifyType(t *testing.T) {
 }
 
 func TestRecursiveObjectType(t *testing.T) {
+	t.Parallel()
+
 	makeType := func(prop string) Type {
 		props := map[string]Type{
 			prop: NewOutputType(IntType),
@@ -712,3 +715,434 @@ func TestRecursiveObjectType(t *testing.T) {
 	hasOutputs, _ = ContainsEventuals(inputLinkedListType)
 	assert.True(t, hasOutputs)
 }
+
+// Tests that object type annotations can be added and queried correctly.
+func TestObjectTypeAnnotations(t *testing.T) {
+	t.Parallel()
+
+	// Tests that an annotation of a non-interface type (here, *x) can be added and queried correctly, whether added using
+	// NewObjectType, Annotate or append.
+	t.Run("new/x-x", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{}, expected)
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[*x](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find an annotation of type *x")
+		require.Same(t, expected, actual)
+	})
+
+	t.Run("append/x-x", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{})
+		o.Annotations = append(o.Annotations, expected)
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[*x](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find an annotation of type *x")
+		require.Same(t, expected, actual)
+	})
+
+	t.Run("annotate/x-x", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{})
+		o.Annotate(expected)
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[*x](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find an annotation of type *x")
+		require.Same(t, expected, actual)
+	})
+
+	// Tests that when multiple annotations of a non-interface type (here, *x) are added, the first is returned by a
+	// query, whether they are added by NewObjectType, Annotate or append.
+	t.Run("new/x-x-x", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{}, expected, &x{})
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[*x](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find the first annotation of type *x")
+		require.Same(t, expected, actual)
+	})
+
+	t.Run("append/x-x-x", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{})
+		o.Annotations = append(o.Annotations, expected, &x{})
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[*x](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find the first annotation of type *x")
+		require.Same(t, expected, actual)
+	})
+
+	t.Run("annotate/x-x-x", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{})
+		o.Annotate(expected, &x{})
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[*x](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find the first annotation of type *x")
+		require.Same(t, expected, actual)
+	})
+
+	// Tests that when an annotation is queried by non-interface type and there is no match, that no annotations are
+	// returned, whether they were added by NewObjectType, Annotate or append.
+	t.Run("new/x-y", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		o := NewObjectType(map[string]Type{}, &x{})
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[*y](o)
+
+		// Assert.
+		require.False(t, ok, "did not expect to find an annotation of type *y")
+		require.Nil(t, actual)
+	})
+
+	t.Run("append/x-y", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		o := NewObjectType(map[string]Type{})
+		o.Annotations = append(o.Annotations, &x{})
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[*y](o)
+
+		// Assert.
+		require.False(t, ok, "did not expect to find an annotation of type *y")
+		require.Nil(t, actual)
+	})
+
+	t.Run("annotate/x-y", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		o := NewObjectType(map[string]Type{})
+		o.Annotate(&x{})
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[*y](o)
+
+		// Assert.
+		require.False(t, ok, "did not expect to find an annotation of type *y")
+		require.Nil(t, actual)
+	})
+
+	// Tests that when an annotation is queried by interface type (here i, with an implementation of *x), the correct
+	// annotation is returned, whether it was added by NewObjectType, Annotate or append.
+	t.Run("new/x-i", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{}, expected)
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[i](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find an annotation of type i (*x)")
+		require.Same(t, expected, actual)
+	})
+
+	t.Run("append/x-i", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{})
+		o.Annotations = append(o.Annotations, expected)
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[i](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find an annotation of type i (*x)")
+		require.Same(t, expected, actual)
+	})
+
+	t.Run("annotate/x-i", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{})
+		o.Annotate(expected)
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[i](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find an annotation of type i (*x)")
+		require.Same(t, expected, actual)
+	})
+
+	// Tests that when an annotation is queried by interface type (here i) and there are no matching implementations, no
+	// annotation is returned, whether they were added by NewObjectType, Annotate or append.
+	t.Run("new/z-i", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		o := NewObjectType(map[string]Type{}, &z{})
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[i](o)
+
+		// Assert.
+		require.False(t, ok, "did not expect to find an annotation of type i")
+		require.Nil(t, actual)
+	})
+
+	t.Run("append/z-i", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		o := NewObjectType(map[string]Type{})
+		o.Annotations = append(o.Annotations, &z{})
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[i](o)
+
+		// Assert.
+		require.False(t, ok, "did not expect to find an annotation of type i")
+		require.Nil(t, actual)
+	})
+
+	t.Run("annotate/z-i", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		o := NewObjectType(map[string]Type{})
+		o.Annotate(&z{})
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[i](o)
+
+		// Assert.
+		require.False(t, ok, "did not expect to find an annotation of type i")
+		require.Nil(t, actual)
+	})
+
+	// Tests that when multiple (identically typed) implementations of an interface type (here i) are added, the first is
+	// returned by a query for that interface type, whether they were added by NewObjectType, Annotate or append.
+	t.Run("new/x-x-i", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{}, expected, &x{})
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[i](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find the first annotation of type i (*x)")
+		require.Same(t, expected, actual)
+	})
+
+	t.Run("append/x-x-i", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{})
+		o.Annotations = append(o.Annotations, expected, &x{})
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[i](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find the first annotation of type i (*x)")
+		require.Same(t, expected, actual)
+	})
+
+	t.Run("annotate/x-x-i", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{})
+		o.Annotate(expected, &x{})
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[i](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find the first annotation of type i (*x)")
+		require.Same(t, expected, actual)
+	})
+
+	// Tests that when multiple (differently typed) implementations of an interface type (here i) are added, the first is
+	// returned by a query for that interface type, whether they were added by NewObjectType, Annotate or append.
+	t.Run("new/x-y-i", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{}, expected, &y{})
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[i](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find an annotation of type i (*x)")
+		require.Same(t, expected, actual)
+	})
+
+	t.Run("append/x-y-i", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{})
+		o.Annotations = append(o.Annotations, expected, &y{})
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[i](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find an annotation of type i (*x)")
+		require.Same(t, expected, actual)
+	})
+
+	t.Run("annotate/x-y-i", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{})
+		o.Annotate(expected, &y{})
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[i](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find an annotation of type i (*x)")
+		require.Same(t, expected, actual)
+	})
+
+	// Tests that interface type queries return the first implementing annotation, even if there are annotations of
+	// non-implementing types present. Tests this whether the annotations were added by NewObjectType, Annotate or append.
+	t.Run("new/z-x-i", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{}, &z{}, expected)
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[i](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find an annotation of type i (*x)")
+		require.Same(t, expected, actual)
+	})
+
+	t.Run("append/z-x-i", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{})
+		o.Annotations = append(o.Annotations, &z{}, expected)
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[i](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find an annotation of type i (*x)")
+		require.Same(t, expected, actual)
+	})
+
+	t.Run("annotate/z-x-i", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange.
+		expected := &x{}
+
+		o := NewObjectType(map[string]Type{})
+		o.Annotate(&z{}, expected)
+
+		// Act.
+		actual, ok := GetObjectTypeAnnotation[i](o)
+
+		// Assert.
+		require.True(t, ok, "expected to find an annotation of type i (*x)")
+		require.Same(t, expected, actual)
+	})
+}
+
+type i interface {
+	f() string
+}
+
+type x struct{}
+
+func (*x) f() string {
+	return "x"
+}
+
+var _ i = (*x)(nil)
+
+type y struct{}
+
+func (*y) f() string {
+	return "y"
+}
+
+var _ i = (*y)(nil)
+
+type z struct{}

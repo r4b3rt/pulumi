@@ -1,15 +1,30 @@
+// Copyright 2020-2024, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package python
 
 import (
 	"fmt"
 	"testing"
 
-	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/pcl"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestLowerPropertyAccess(t *testing.T) {
+	t.Parallel()
 
 	const source = `zones = invoke("aws:index:getAvailabilityZones", {})
 
@@ -18,12 +33,14 @@ resource vpcSubnet "aws:ec2:Subnet" {
 
 	cidrBlock = "10.100.${range.key}.0/24"
 	availabilityZone = range.value
+	vpcId = 1
 }
 
 resource rta "aws:ec2:RouteTableAssociation" {
 	options { range = zones.names }
 
 	subnetId = vpcSubnet[range.key].id
+	routeTableId = 1
 }
 `
 	program, diags := parseAndBindProgram(t, source, "lower_property_access.pp")
@@ -32,9 +49,9 @@ resource rta "aws:ec2:RouteTableAssociation" {
 	g, err := newGenerator(program)
 	assert.NoError(t, err)
 
-	var rta *hcl2.Resource
+	var rta *pcl.Resource
 	for _, n := range g.program.Nodes {
-		if r, ok := n.(*hcl2.Resource); ok && r.Name() == "rta" {
+		if r, ok := n.(*pcl.Resource); ok && r.Name() == "rta" {
 			rta = r
 			break
 		}

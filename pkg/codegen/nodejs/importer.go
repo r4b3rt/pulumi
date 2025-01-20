@@ -52,8 +52,29 @@ type NodePackageInfo struct {
 	DisableUnionOutputTypes bool `json:"disableUnionOutputTypes,omitempty"`
 	// An indicator for whether the package contains enums.
 	ContainsEnums bool `json:"containsEnums,omitempty"`
-	// A map allowing you to map the name of a provider to the name of the module encapsulating the provider
+	// A map allowing you to map the name of a provider to the name of the module encapsulating the provider.
 	ProviderNameToModuleName map[string]string `json:"providerNameToModuleName,omitempty"`
+	// Additional files to include in TypeScript compilation.
+	// These paths are added to the `files` section of the
+	// generated `tsconfig.json`. A typical use case for this is
+	// compiling hand-authored unit test files that check the
+	// generated code.
+	ExtraTypeScriptFiles []string `json:"extraTypeScriptFiles,omitempty"`
+	// Determines whether to make single-return-value methods return an output object or the single value.
+	LiftSingleValueMethodReturns bool `json:"liftSingleValueMethodReturns,omitempty"`
+
+	// Respect the Pkg.Version field in the schema
+	RespectSchemaVersion bool `json:"respectSchemaVersion,omitempty"`
+
+	// Experimental flag that permits `import type *` style code
+	// to be generated to optimize startup time of programs
+	// consuming the provider by minimizing the set of Node
+	// modules loaded at startup. Turning this on may currently
+	// generate non-compiling code for some providers; but if the
+	// code compiles it is safe to use. Also, turning this on
+	// requires TypeScript 3.8 or higher to compile the generated
+	// code.
+	UseTypeOnlyReferences bool `json:"useTypeOnlyReferences,omitempty"`
 }
 
 // NodeObjectInfo contains NodeJS-specific information for an object.

@@ -1,81 +1,58 @@
+// Copyright 2020-2024, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package nodejs
 
 import (
-	"bytes"
-	"io/ioutil"
-	"path/filepath"
-	"strings"
 	"testing"
 
-	"github.com/hashicorp/hcl/v2"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/pcl"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/testing/test"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 	"github.com/stretchr/testify/assert"
-
-	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2"
-	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/syntax"
-	"github.com/pulumi/pulumi/pkg/v3/codegen/internal/test"
 )
 
-var testdataPath = filepath.Join("..", "internal", "test", "testdata")
+func TestGenerateProgramVersionSelection(t *testing.T) {
+	t.Parallel()
 
-func TestGenProgram(t *testing.T) {
-	files, err := ioutil.ReadDir(testdataPath)
-	if err != nil {
-		t.Fatalf("could not read test data: %v", err)
+	test.GenerateNodeJSProgramTest(
+		t,
+		GenerateProgram,
+		func(
+			directory string, project workspace.Project, program *pcl.Program, localDependencies map[string]string,
+		) error {
+			return GenerateProject(directory, project, program, localDependencies, false)
+		},
+	)
+}
+
+func TestEnumReferencesCorrectIdentifier(t *testing.T) {
+	t.Parallel()
+	s := &schema.Package{
+		Name: "pulumiservice",
+		Language: map[string]interface{}{
+			"nodejs": NodePackageInfo{
+				PackageName: "@pulumi/bar",
+			},
+		},
 	}
+	result, err := enumNameWithPackage("pulumiservice:index:WebhookFilters", s.Reference())
+	assert.NoError(t, err)
+	assert.Equal(t, "pulumiservice.WebhookFilters", result)
 
-	for _, f := range files {
-		if filepath.Ext(f.Name()) != ".pp" {
-			continue
-		}
-
-		expectNYIDiags := false
-		if filepath.Base(f.Name()) == "aws-s3-folder.pp" {
-			expectNYIDiags = true
-		}
-
-		t.Run(f.Name(), func(t *testing.T) {
-			path := filepath.Join(testdataPath, f.Name())
-			contents, err := ioutil.ReadFile(path)
-			if err != nil {
-				t.Fatalf("could not read %v: %v", path, err)
-			}
-			expected, err := ioutil.ReadFile(path + ".ts")
-			if err != nil {
-				t.Fatalf("could not read %v: %v", path+".ts", err)
-			}
-
-			parser := syntax.NewParser()
-			err = parser.ParseFile(bytes.NewReader(contents), f.Name())
-			if err != nil {
-				t.Fatalf("could not read %v: %v", path, err)
-			}
-			if parser.Diagnostics.HasErrors() {
-				t.Fatalf("failed to parse files: %v", parser.Diagnostics)
-			}
-
-			program, diags, err := hcl2.BindProgram(parser.Files, hcl2.PluginHost(test.NewHost(testdataPath)))
-			if err != nil {
-				t.Fatalf("could not bind program: %v", err)
-			}
-			if diags.HasErrors() {
-				t.Fatalf("failed to bind program: %v", diags)
-			}
-
-			files, diags, err := GenerateProgram(program)
-			assert.NoError(t, err)
-			if expectNYIDiags {
-				var tmpDiags hcl.Diagnostics
-				for _, d := range diags {
-					if !strings.HasPrefix(d.Summary, "not yet implemented") {
-						tmpDiags = append(tmpDiags, d)
-					}
-				}
-				diags = tmpDiags
-			}
-			if diags.HasErrors() {
-				t.Fatalf("failed to generate program: %v", diags)
-			}
-			assert.Equal(t, string(expected), string(files["index.ts"]))
-		})
-	}
+	// These are redundant, but serve to clarify our expectations around package alias names.
+	assert.NotEqual(t, "bar.WebhookFilters", result)
+	assert.NotEqual(t, "@pulumi/bar.WebhookFilters", result)
 }

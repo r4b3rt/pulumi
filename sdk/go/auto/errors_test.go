@@ -11,25 +11,34 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//go:build !xplatform_acceptance
 
 package auto
 
 import (
 	"context"
-	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 
+	ptesting "github.com/pulumi/pulumi/sdk/v3/go/common/testing"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"github.com/pulumi/pulumi/sdk/v3/python/toolchain"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestConcurrentUpdateError(t *testing.T) {
+	t.Parallel()
+
+	// TODO[pulumi/pulumi#8122] - investigate underlying sporadic 404 error
+	t.Skip("disabled as flaky and resource-intensive")
+
+	n := 50
 	ctx := context.Background()
 	pName := "conflict_error"
-	sName := fmt.Sprintf("int_test%d", rangeIn(10000000, 99999999))
+	sName := ptesting.RandomStackName()
 	stackName := FullyQualifiedStackName(pulumiOrg, pName, sName)
 
 	// initialize
@@ -49,7 +58,7 @@ func TestConcurrentUpdateError(t *testing.T) {
 	c := make(chan error)
 
 	// parallel updates to cause conflict
-	for i := 0; i < 50; i++ {
+	for i := 0; i < n; i++ {
 		go func() {
 			_, err := s.Up(ctx)
 			c <- err
@@ -57,11 +66,16 @@ func TestConcurrentUpdateError(t *testing.T) {
 	}
 
 	conflicts := 0
+	var otherErrors []error
 
-	for i := 0; i < 50; i++ {
+	for i := 0; i < n; i++ {
 		err := <-c
-		if IsConcurrentUpdateError(err) {
-			conflicts++
+		if err != nil {
+			if IsConcurrentUpdateError(err) {
+				conflicts++
+			} else {
+				otherErrors = append(otherErrors, err)
+			}
 		}
 	}
 
@@ -73,20 +87,29 @@ func TestConcurrentUpdateError(t *testing.T) {
 		t.FailNow()
 	}
 
-	// should have at least one conflict
-	assert.Greater(t, conflicts, 0)
+	if len(otherErrors) > 0 {
+		t.Logf("Concurrent updates incurred %d non-conflict errors, including:", len(otherErrors))
+		for _, err := range otherErrors {
+			t.Error(err)
+		}
+	}
+
+	if conflicts == 0 {
+		t.Errorf("Expected at least one conflict error from the %d concurrent updates, but got none", n)
+	}
 }
 
 func TestInlineConcurrentUpdateError(t *testing.T) {
-	t.Skip("disabled, see https://github.com/pulumi/pulumi/issues/5312")
+	t.Parallel()
+
 	ctx := context.Background()
 	pName := "inline_conflict_error"
-	sName := fmt.Sprintf("int_test%d", rangeIn(10000000, 99999999))
+	sName := ptesting.RandomStackName()
 	stackName := FullyQualifiedStackName(pulumiOrg, pName, sName)
 
 	// initialize
 	s, err := NewStackInlineSource(ctx, stackName, pName, func(ctx *pulumi.Context) error {
-		time.Sleep(1 * time.Second)
+		time.Sleep(5 * time.Second)
 		ctx.Export("exp_static", pulumi.String("foo"))
 		return nil
 	})
@@ -135,8 +158,10 @@ func TestInlineConcurrentUpdateError(t *testing.T) {
 const compilationErrProj = "compilation_error"
 
 func TestCompilationErrorGo(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
-	sName := fmt.Sprintf("int_test%d", rangeIn(10000000, 99999999))
+	sName := ptesting.RandomStackName()
 	stackName := FullyQualifiedStackName(pulumiOrg, compilationErrProj, sName)
 
 	// initialize
@@ -154,8 +179,7 @@ func TestCompilationErrorGo(t *testing.T) {
 	}()
 
 	_, err = s.Up(ctx)
-	assert.NotNil(t, err)
-	assert.True(t, IsCompilationError(err))
+	assert.True(t, IsCompilationError(err), "%v is not a compilation error", err)
 
 	// -- pulumi destroy --
 
@@ -167,8 +191,10 @@ func TestCompilationErrorGo(t *testing.T) {
 }
 
 func TestSelectStack404Error(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
-	sName := fmt.Sprintf("int_test%d", rangeIn(10000000, 99999999))
+	sName := ptesting.RandomStackName()
 	stackName := FullyQualifiedStackName(pulumiOrg, "testproj", sName)
 
 	// initialize
@@ -182,13 +208,14 @@ func TestSelectStack404Error(t *testing.T) {
 
 	// attempt to select stack that has not been created.
 	_, err = SelectStack(ctx, stackName, w)
-	assert.NotNil(t, err)
-	assert.True(t, IsSelectStack404Error(err))
+	assert.True(t, IsSelectStack404Error(err), "%v is not a 404 error", err)
 }
 
 func TestCreateStack409Error(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
-	sName := fmt.Sprintf("int_test%d", rangeIn(10000000, 99999999))
+	sName := ptesting.RandomStackName()
 	stackName := FullyQualifiedStackName(pulumiOrg, "testproj", sName)
 
 	// initialize first stack
@@ -215,13 +242,14 @@ func TestCreateStack409Error(t *testing.T) {
 
 	// attempt to create a dupe stack.
 	_, err = NewStack(ctx, stackName, w)
-	assert.NotNil(t, err)
-	assert.True(t, IsCreateStack409Error(err))
+	assert.True(t, IsCreateStack409Error(err), "%v is not a 409 error", err)
 }
 
 func TestCompilationErrorDotnet(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
-	sName := fmt.Sprintf("int_test%d", rangeIn(10000000, 99999999))
+	sName := ptesting.RandomStackName()
 	stackName := FullyQualifiedStackName(pulumiOrg, compilationErrProj, sName)
 
 	// initialize
@@ -239,8 +267,7 @@ func TestCompilationErrorDotnet(t *testing.T) {
 	}()
 
 	_, err = s.Up(ctx)
-	assert.NotNil(t, err)
-	assert.True(t, IsCompilationError(err))
+	assert.True(t, IsCompilationError(err), "%v is not a compilation error", err)
 
 	// -- pulumi destroy --
 
@@ -252,8 +279,10 @@ func TestCompilationErrorDotnet(t *testing.T) {
 }
 
 func TestCompilationErrorTypescript(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
-	sName := fmt.Sprintf("int_test%d", rangeIn(10000000, 99999999))
+	sName := ptesting.RandomStackName()
 	stackName := FullyQualifiedStackName(pulumiOrg, compilationErrProj, sName)
 
 	// initialize
@@ -280,8 +309,7 @@ func TestCompilationErrorTypescript(t *testing.T) {
 	}()
 
 	_, err = s.Up(ctx)
-	assert.NotNil(t, err)
-	assert.True(t, IsCompilationError(err))
+	assert.True(t, IsCompilationError(err), "%v is not a compilation error", err)
 
 	// -- pulumi destroy --
 
@@ -295,8 +323,10 @@ func TestCompilationErrorTypescript(t *testing.T) {
 const runtimeErrProj = "runtime_error"
 
 func TestRuntimeErrorGo(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
-	sName := fmt.Sprintf("int_test%d", rangeIn(10000000, 99999999))
+	sName := ptesting.RandomStackName()
 	stackName := FullyQualifiedStackName(pulumiOrg, runtimeErrProj, sName)
 
 	// initialize
@@ -314,8 +344,7 @@ func TestRuntimeErrorGo(t *testing.T) {
 	}()
 
 	_, err = s.Up(ctx)
-	assert.NotNil(t, err)
-	assert.True(t, IsRuntimeError(err))
+	assert.True(t, IsRuntimeError(err), "%v is not a runtime error", err)
 
 	// -- pulumi destroy --
 
@@ -327,15 +356,15 @@ func TestRuntimeErrorGo(t *testing.T) {
 }
 
 func TestRuntimeErrorInlineGo(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
-	sName := fmt.Sprintf("int_test%d", rangeIn(10000000, 99999999))
+	sName := ptesting.RandomStackName()
 	stackName := FullyQualifiedStackName(pulumiOrg, runtimeErrProj, sName)
 
 	// initialize
 	s, err := NewStackInlineSource(ctx, stackName, runtimeErrProj, func(ctx *pulumi.Context) error {
-		var x []string
-		ctx.Export("a", pulumi.String(x[0]))
-		return nil
+		panic("great sadness")
 	})
 	if err != nil {
 		t.Errorf("failed to initialize stack, err: %v", err)
@@ -349,10 +378,7 @@ func TestRuntimeErrorInlineGo(t *testing.T) {
 	}()
 
 	_, err = s.Up(ctx)
-	assert.NotNil(t, err)
-	if !assert.True(t, IsRuntimeError(err)) {
-		t.Logf("%v is not a runtime error", err)
-	}
+	assert.True(t, IsRuntimeError(err), "%v is not a runtime error", err)
 
 	// -- pulumi destroy --
 
@@ -364,18 +390,51 @@ func TestRuntimeErrorInlineGo(t *testing.T) {
 }
 
 func TestRuntimeErrorPython(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
-	sName := fmt.Sprintf("int_test%d", rangeIn(10000000, 99999999))
+	sName := ptesting.RandomStackName()
 	stackName := FullyQualifiedStackName(pulumiOrg, runtimeErrProj, sName)
 
 	// initialize
-	pDir := filepath.Join(".", "test", "errors", "runtime_error", "python")
-
-	cmd := exec.Command("python3", "-m", "venv", "venv")
-	cmd.Dir = pDir
-	err := cmd.Run()
+	pDir, err := filepath.Abs(filepath.Join(".", "test", "errors", "runtime_error", "python"))
 	if err != nil {
-		t.Errorf("failed to install project dependencies")
+		t.Error(err)
+		t.FailNow()
+	}
+
+	tc, err := toolchain.ResolveToolchain(toolchain.PythonOptions{
+		Toolchain:  toolchain.Pip,
+		Root:       pDir,
+		Virtualenv: "venv",
+	})
+	if err != nil {
+		t.Error(err)
+		t.FailNow()
+	}
+	err = tc.InstallDependencies(context.Background(), pDir, false, /*useLanguageVersionTools */
+		true /*showOutput*/, os.Stdout, os.Stderr)
+	if err != nil {
+		t.Errorf("failed to create a venv and install project dependencies: %v", err)
+		t.FailNow()
+	}
+
+	pySDK, err := filepath.Abs(filepath.Join("..", "..", "..", "sdk", "python"))
+	if err != nil {
+		t.Error(err)
+		t.FailNow()
+	}
+
+	// install Pulumi Python SDK from the current source tree, -e means no-copy, ref directly
+	pyCmd, err := tc.ModuleCommand(context.Background(), "pip", "install", "-e", pySDK)
+	if err != nil {
+		t.Errorf("failed to install the local SDK: %v", err)
+		t.FailNow()
+	}
+	pyCmd.Dir = pDir
+	err = pyCmd.Run()
+	if err != nil {
+		t.Errorf("failed to link venv against in-source pulumi: %v", err)
 		t.FailNow()
 	}
 
@@ -392,8 +451,8 @@ func TestRuntimeErrorPython(t *testing.T) {
 	}()
 
 	_, err = s.Up(ctx)
-	assert.NotNil(t, err)
-	assert.True(t, IsRuntimeError(err), "%+v", err)
+	assert.True(t, IsRuntimeError(err), "%v is not a runtime error", err)
+	assert.ErrorContains(t, err, "IndexError: list index out of range")
 
 	// -- pulumi destroy --
 
@@ -405,8 +464,10 @@ func TestRuntimeErrorPython(t *testing.T) {
 }
 
 func TestRuntimeErrorJavascript(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
-	sName := fmt.Sprintf("int_test%d", rangeIn(10000000, 99999999))
+	sName := ptesting.RandomStackName()
 	stackName := FullyQualifiedStackName(pulumiOrg, runtimeErrProj, sName)
 
 	// initialize
@@ -433,8 +494,7 @@ func TestRuntimeErrorJavascript(t *testing.T) {
 	}()
 
 	_, err = s.Up(ctx)
-	assert.NotNil(t, err)
-	assert.True(t, IsRuntimeError(err))
+	assert.True(t, IsRuntimeError(err), "%v is not a runtime error", err)
 
 	// -- pulumi destroy --
 
@@ -446,8 +506,10 @@ func TestRuntimeErrorJavascript(t *testing.T) {
 }
 
 func TestRuntimeErrorTypescript(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
-	sName := fmt.Sprintf("int_test%d", rangeIn(10000000, 99999999))
+	sName := ptesting.RandomStackName()
 	stackName := FullyQualifiedStackName(pulumiOrg, runtimeErrProj, sName)
 
 	// initialize
@@ -474,8 +536,7 @@ func TestRuntimeErrorTypescript(t *testing.T) {
 	}()
 
 	_, err = s.Up(ctx)
-	assert.NotNil(t, err)
-	assert.True(t, IsRuntimeError(err))
+	assert.True(t, IsRuntimeError(err), "%v is not a runtime error", err)
 
 	// -- pulumi destroy --
 
@@ -487,8 +548,10 @@ func TestRuntimeErrorTypescript(t *testing.T) {
 }
 
 func TestRuntimeErrorDotnet(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
-	sName := fmt.Sprintf("int_test%d", rangeIn(10000000, 99999999))
+	sName := ptesting.RandomStackName()
 	stackName := FullyQualifiedStackName(pulumiOrg, runtimeErrProj, sName)
 
 	// initialize
@@ -506,8 +569,7 @@ func TestRuntimeErrorDotnet(t *testing.T) {
 	}()
 
 	_, err = s.Up(ctx)
-	assert.NotNil(t, err)
-	assert.True(t, IsRuntimeError(err))
+	assert.True(t, IsRuntimeError(err), "%v is not a runtime error", err)
 
 	// -- pulumi destroy --
 

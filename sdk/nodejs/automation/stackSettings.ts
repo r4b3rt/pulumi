@@ -12,31 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import * as yaml from "js-yaml";
-
 /**
- * A description of the Stack's configuration and encryption metadata.
+ * A description of a {@link Stack}'s configuration and encryption metadata.
  */
 export interface StackSettings {
     secretsProvider?: string;
     encryptedKey?: string;
     encryptionSalt?: string;
-    config?: {[key: string]: StackSettingsConfigValue};
+    config?: { [key: string]: StackSettingsConfigValue };
 }
 
 /**
- * Stack configuration entry
+ * A stack configuration entry.
  */
 export type StackSettingsConfigValue = string | StackSettingsSecureConfigValue | any;
 
 /**
- * A secret Stack config entry
+ * A secret stack configuration entry.
  */
 export interface StackSettingsSecureConfigValue {
     secure: string;
 }
 
-/** @internal */
+/**
+ * @internal
+ */
 export const stackSettingsSerDeKeys = [
     ["secretsprovider", "secretsProvider"],
     ["encryptedkey", "encryptedKey"],

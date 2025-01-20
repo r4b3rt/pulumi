@@ -1,11 +1,26 @@
+// Copyright 2016-2022, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package engine
 
 import (
-	"github.com/pkg/errors"
+	"errors"
 
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
@@ -28,7 +43,7 @@ type JournalEntry struct {
 
 type JournalEntries []JournalEntry
 
-func (entries JournalEntries) Snap(base *deploy.Snapshot) *deploy.Snapshot {
+func (entries JournalEntries) Snap(base *deploy.Snapshot) (*deploy.Snapshot, error) {
 	// Build up a list of current resources by replaying the journal.
 	resources, dones := []*resource.State{}, make(map[*resource.State]bool)
 	ops, doneOps := []resource.Operation{}, make(map[*resource.State]bool)
@@ -53,19 +68,28 @@ func (entries JournalEntries) Snap(base *deploy.Snapshot) *deploy.Snapshot {
 			}
 		case JournalEntryFailure, JournalEntrySuccess:
 			switch e.Step.Op() {
-			// nolint: lll
+			//nolint:lll
 			case deploy.OpCreate, deploy.OpCreateReplacement, deploy.OpRead, deploy.OpReadReplacement, deploy.OpUpdate,
 				deploy.OpImport, deploy.OpImportReplacement:
 				doneOps[e.Step.New()] = true
 			case deploy.OpDelete, deploy.OpDeleteReplaced, deploy.OpReadDiscard, deploy.OpDiscardReplaced:
 				doneOps[e.Step.Old()] = true
 			}
+		case JournalEntryOutputs:
+			// We do nothing for outputs, since they don't affect the snapshot.
 		}
 
 		// Now mark resources done as necessary.
 		if e.Kind == JournalEntrySuccess {
 			switch e.Step.Op() {
-			case deploy.OpSame, deploy.OpUpdate:
+			case deploy.OpSame:
+				step, ok := e.Step.(*deploy.SameStep)
+				contract.Assertf(ok, "expected *deploy.SameStep, got %T", e.Step)
+				if !step.IsSkippedCreate() {
+					resources = append(resources, e.Step.New())
+					dones[e.Step.Old()] = true
+				}
+			case deploy.OpUpdate:
 				resources = append(resources, e.Step.New())
 				dones[e.Step.Old()] = true
 			case deploy.OpCreate, deploy.OpCreateReplacement:
@@ -111,16 +135,34 @@ func (entries JournalEntries) Snap(base *deploy.Snapshot) *deploy.Snapshot {
 		}
 	}
 
-	// If we have a base snapshot, copy over its secrets manager.
+	if base != nil {
+		// Track pending create operations from the base snapshot
+		// and propagate them to the new snapshot: we don't want to clear pending CREATE operations
+		// because these must require user intervention to be cleared or resolved.
+		for _, pendingOperation := range base.PendingOperations {
+			if pendingOperation.Type == resource.OperationTypeCreating {
+				operations = append(operations, pendingOperation)
+			}
+		}
+	}
+
+	// If we have a base snapshot, copy over its secrets manager and metadata.
 	var secretsManager secrets.Manager
+	var metadata deploy.SnapshotMetadata
 	if base != nil {
 		secretsManager = base.SecretsManager
+		metadata = base.Metadata
 	}
 
 	manifest := deploy.Manifest{}
 	manifest.Magic = manifest.NewMagic()
-	return deploy.NewSnapshot(manifest, secretsManager, resources, operations)
 
+	snap := deploy.NewSnapshot(manifest, secretsManager, resources, operations, metadata)
+	normSnap, err := snap.NormalizeURNReferences()
+	if err != nil {
+		return snap, err
+	}
+	return normSnap, normSnap.VerifyIntegrity()
 }
 
 type Journal struct {
@@ -130,7 +172,7 @@ type Journal struct {
 	done    chan bool
 }
 
-func (j *Journal) Entries() []JournalEntry {
+func (j *Journal) Entries() JournalEntries {
 	<-j.done
 
 	return j.entries
@@ -178,7 +220,7 @@ func (j *Journal) RecordPlugin(plugin workspace.PluginInfo) error {
 	return nil
 }
 
-func (j *Journal) Snap(base *deploy.Snapshot) *deploy.Snapshot {
+func (j *Journal) Snap(base *deploy.Snapshot) (*deploy.Snapshot, error) {
 	return j.entries.Snap(base)
 }
 

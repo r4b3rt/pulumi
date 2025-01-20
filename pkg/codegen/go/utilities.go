@@ -20,8 +20,10 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/pkg/errors"
 	"github.com/pulumi/pulumi/pkg/v3/codegen"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/cgstrings"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 )
 
 // isReservedWord returns true if s is a Go reserved word as per
@@ -36,6 +38,21 @@ func isReservedWord(s string) bool {
 		return true
 
 	default:
+		return false
+	}
+}
+
+// isReservedResourceField returns true if s would conflict with a method on a generated
+// resource.
+func isReservedResourceField(resourceName, s string) bool {
+	switch s {
+	case "ID", "URN", "GetProvider", "ElementType":
+		return true
+	default:
+		if resourceName != "" {
+			toOutput := "To" + resourceName + "Output"
+			return s == toOutput || s == toOutput+"WithContext"
+		}
 		return false
 	}
 }
@@ -84,11 +101,12 @@ func makeSafeEnumName(name, typeName string) (string, error) {
 
 	// If the name is one illegal character, return an error.
 	if len(safeName) == 1 && !isLegalIdentifierStart(rune(safeName[0])) {
-		return "", errors.Errorf("enum name %s is not a valid identifier", safeName)
+		return "", fmt.Errorf("enum name %s is not a valid identifier", safeName)
 	}
 
 	// Capitalize and make a valid identifier.
-	safeName = makeValidIdentifier(Title(safeName))
+	safeName = enumTitle(safeName)
+	safeName = makeValidIdentifier(safeName)
 
 	// If there are multiple underscores in a row, replace with one.
 	regex := regexp.MustCompile(`_+`)
@@ -96,10 +114,42 @@ func makeSafeEnumName(name, typeName string) (string, error) {
 
 	// Add the type to the name to disambiguate constants used for enum values
 	if strings.Contains(safeName, "_") && !strings.HasPrefix(safeName, "_") {
-		safeName = fmt.Sprintf("_%s", safeName)
+		safeName = "_" + safeName
 	}
 
 	safeName = typeName + safeName
 
 	return safeName, nil
+}
+
+// Title converts the input string to a title case
+// where only the initial letter is upper-cased.
+// It also removes $-prefix if any.
+func enumTitle(s string) string {
+	if s == "" {
+		return ""
+	}
+	if s[0] == '$' {
+		return Title(s[1:])
+	}
+	s = cgstrings.UppercaseFirst(s)
+	return cgstrings.ModifyStringAroundDelimeter(s, "-", func(next string) string {
+		return "_" + cgstrings.UppercaseFirst(next)
+	})
+}
+
+// Calculate the name of a field in a resource
+func fieldName(pkg *pkgContext, r *schema.Resource, p *schema.Property) string {
+	s := Title(p.Name)
+	var name string
+	if r != nil {
+		name = disambiguatedResourceName(r, pkg)
+	}
+	if !isReservedResourceField(name, s) {
+		return s
+	}
+
+	res := s + "_"
+	contract.Assertf(!isReservedResourceField(name, res), "Name %q is reserved on resource %q", name, res)
+	return res
 }

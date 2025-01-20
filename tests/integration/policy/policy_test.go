@@ -1,4 +1,16 @@
-// Copyright 2016-2020, Pulumi Corporation.  All rights reserved.
+// Copyright 2020-2024, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package ints
 
@@ -15,15 +27,13 @@ import (
 
 // TestPolicyWithConfig runs integration tests against the policy pack in the policy_pack_w_config
 // directory using version 0.4.1-dev of the pulumi/policy sdk.
+//
+//nolint:paralleltest // mutates environment variables
 func TestPolicyWithConfig(t *testing.T) {
 	t.Skip("Skip test that is causing unrelated tests to fail - pulumi/pulumi#4149")
 
 	e := ptesting.NewEnvironment(t)
-	defer func() {
-		if !t.Failed() {
-			e.DeleteEnvironment()
-		}
-	}()
+	defer e.DeleteIfNotFailed()
 
 	// Confirm we have credentials.
 	if os.Getenv("PULUMI_ACCESS_TOKEN") == "" {
@@ -36,7 +46,7 @@ func TestPolicyWithConfig(t *testing.T) {
 	policyPackName := fmt.Sprintf("%s-%x", "test-policy-pack", time.Now().UnixNano())
 	e.ImportDirectory("policy_pack_w_config")
 	e.RunCommand("yarn", "install")
-	os.Setenv("TEST_POLICY_PACK", policyPackName)
+	t.Setenv("TEST_POLICY_PACK", policyPackName)
 
 	// Publish the Policy Pack twice.
 	publishPolicyPackWithVersion(e, orgName, `"0.0.1"`)
@@ -90,15 +100,13 @@ func TestPolicyWithConfig(t *testing.T) {
 
 // TestPolicyWithoutConfig runs integration tests against the policy pack in the policy_pack_w_config
 // directory. This tests against version 0.4.0 of the pulumi/policy sdk, prior to policy config being supported.
+//
+//nolint:paralleltest // mutates environment variables
 func TestPolicyWithoutConfig(t *testing.T) {
 	t.Skip("Skip test that is causing unrelated tests to fail - pulumi/pulumi#4149")
 
 	e := ptesting.NewEnvironment(t)
-	defer func() {
-		if !t.Failed() {
-			e.DeleteEnvironment()
-		}
-	}()
+	defer e.DeleteIfNotFailed()
 
 	// Confirm we have credentials.
 	if os.Getenv("PULUMI_ACCESS_TOKEN") == "" {
@@ -112,7 +120,7 @@ func TestPolicyWithoutConfig(t *testing.T) {
 	policyPackName := fmt.Sprintf("%s-%x", "test-policy-pack", time.Now().UnixNano())
 	e.ImportDirectory("policy_pack_wo_config")
 	e.RunCommand("yarn", "install")
-	os.Setenv("TEST_POLICY_PACK", policyPackName)
+	t.Setenv("TEST_POLICY_PACK", policyPackName)
 
 	// Publish the Policy Pack twice.
 	e.RunCommand("pulumi", "policy", "publish", orgName)
@@ -151,6 +159,7 @@ type policyGroupsJSON struct {
 	NumStacks      int    `json:"numStacks"`
 }
 
+//nolint:unused // Used by skipped test
 func assertJSON(e *ptesting.Environment, out string, respObj interface{}) {
 	err := json.Unmarshal([]byte(out), &respObj)
 	if err != nil {
@@ -160,6 +169,8 @@ func assertJSON(e *ptesting.Environment, out string, respObj interface{}) {
 
 // publishPolicyPackWithVersion updates the version in package.json so we can
 // dynamically publish different versions for testing.
+//
+//nolint:unused // Used by skipped test
 func publishPolicyPackWithVersion(e *ptesting.Environment, orgName, version string) {
 	cmd := fmt.Sprintf(`sed 's/{ policyVersion }/%s/g' package.json.tmpl | tee package.json`, version)
 	e.RunCommand("bash", "-c", cmd)

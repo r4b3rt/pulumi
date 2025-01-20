@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,26 +19,25 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
-	"reflect"
 	"runtime"
 	"strings"
-
-	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
+	"time"
 
 	"github.com/google/go-querystring/query"
 	"github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
 
 	"github.com/pulumi/pulumi/pkg/v3/util/tracing"
-	"github.com/pulumi/pulumi/pkg/v3/version"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/httputil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/version"
 )
 
 const (
@@ -46,11 +45,15 @@ const (
 	apiRequestDetailLogLevel = 11 // log level for logging extra details about API requests and responses
 )
 
+func UserAgent() string {
+	return fmt.Sprintf("pulumi-cli/1 (%s; %s)", version.Version, runtime.GOOS)
+}
+
 // StackIdentifier is the set of data needed to identify a Pulumi Cloud stack.
 type StackIdentifier struct {
 	Owner   string
 	Project string
-	Stack   string
+	Stack   tokens.StackName
 }
 
 func (s StackIdentifier) String() string {
@@ -79,15 +82,23 @@ const (
 // accessToken is an abstraction over the two different kinds of access tokens used by the Pulumi API.
 type accessToken interface {
 	Kind() accessTokenKind
-	String() string
+	Get(ctx context.Context) (string, error)
 }
 
 type httpCallOptions struct {
-	// RetryAllMethods allows non-GET calls to be retried if the server fails to return a response.
-	RetryAllMethods bool
+	// RetryPolicy defines the policy for retrying requests by httpClient.Do.
+	//
+	// By default, only GET requests are retried.
+	RetryPolicy retryPolicy
 
 	// GzipCompress compresses the request using gzip before sending it.
 	GzipCompress bool
+
+	// Header is any additional headers to add to the request.
+	Header http.Header
+
+	// ErrorResponse is an optional response body for errors.
+	ErrorResponse any
 }
 
 // apiAccessToken is an implementation of accessToken for Pulumi API tokens (i.e. tokens of kind
@@ -98,26 +109,127 @@ func (apiAccessToken) Kind() accessTokenKind {
 	return accessTokenKindAPIToken
 }
 
-func (t apiAccessToken) String() string {
-	return string(t)
+func (t apiAccessToken) Get(_ context.Context) (string, error) {
+	return string(t), nil
 }
 
-// updateAccessToken is an implementation of accessToken for update lease tokens (i.e. tokens of kind
-// accessTokenKindUpdateToken)
-type updateAccessToken string
+// UpdateTokenSource allows the API client to request tokens for an in-progress update as near as possible to the
+// actual API call (e.g. after marshaling, etc.).
+type UpdateTokenSource interface {
+	GetToken(ctx context.Context) (string, error)
+}
 
-func (updateAccessToken) Kind() accessTokenKind {
+type updateTokenStaticSource string
+
+func (t updateTokenStaticSource) GetToken(_ context.Context) (string, error) {
+	return string(t), nil
+}
+
+// updateToken is an implementation of accessToken for update lease tokens (i.e. tokens of kind
+// accessTokenKindUpdateToken)
+type updateToken struct {
+	source UpdateTokenSource
+}
+
+func updateAccessToken(source UpdateTokenSource) updateToken {
+	return updateToken{source: source}
+}
+
+func (updateToken) Kind() accessTokenKind {
 	return accessTokenKindUpdateToken
 }
 
-func (t updateAccessToken) String() string {
-	return string(t)
+func (t updateToken) Get(ctx context.Context) (string, error) {
+	return t.source.GetToken(ctx)
+}
+
+func float64Ptr(f float64) *float64 {
+	return &f
+}
+
+func durationPtr(d time.Duration) *time.Duration {
+	return &d
+}
+
+func intPtr(i int) *int {
+	return &i
+}
+
+// retryPolicy defines the policy for retrying requests by httpClient.Do.
+type retryPolicy int
+
+const (
+	// retryNone indicates that no retry should be attempted.
+	retryNone retryPolicy = iota - 1
+
+	// retryGetMethod indicates that only GET requests should be retried.
+	//
+	// This is the default retry policy.
+	retryGetMethod // == 0
+
+	// retryAllMethods indicates that all requests should be retried.
+	retryAllMethods
+)
+
+func (p retryPolicy) String() string {
+	switch p {
+	case retryNone:
+		return "none"
+	case retryGetMethod:
+		return "get"
+	case retryAllMethods:
+		return "all"
+	default:
+		return fmt.Sprintf("retryPolicy(%d)", p)
+	}
+}
+
+func (p retryPolicy) shouldRetry(req *http.Request) bool {
+	switch p {
+	case retryNone:
+		return false
+	case retryGetMethod:
+		return req.Method == http.MethodGet
+	case retryAllMethods:
+		return true
+	default:
+		contract.Failf("unknown retry policy: %v", p)
+		return false // unreachable
+	}
+}
+
+// httpClient is an HTTP client abstraction, used by defaultRESTClient.
+type httpClient interface {
+	Do(req *http.Request, policy retryPolicy) (*http.Response, error)
+}
+
+// defaultHTTPClient is an implementation of httpClient that provides a basic implementation of Do
+// using the specified *http.Client, with retry support.
+type defaultHTTPClient struct {
+	client *http.Client
+}
+
+func (c *defaultHTTPClient) Do(req *http.Request, policy retryPolicy) (*http.Response, error) {
+	// Wait 1s before retrying on failure. Then increase by 2x until the
+	// maximum delay is reached. Stop after maxRetryCount requests have
+	// been made.
+	opts := httputil.RetryOpts{
+		Delay:    durationPtr(time.Second),
+		Backoff:  float64Ptr(2.0),
+		MaxDelay: durationPtr(30 * time.Second),
+
+		MaxRetryCount:         intPtr(4),
+		HandshakeTimeoutsOnly: !policy.shouldRetry(req),
+	}
+	return httputil.DoWithRetryOpts(req, c.client, opts)
 }
 
 // pulumiAPICall makes an HTTP request to the Pulumi API.
-func pulumiAPICall(ctx context.Context, d diag.Sink, cloudAPI, method, path string, body []byte, tok accessToken,
-	opts httpCallOptions) (string, *http.Response, error) {
-
+func pulumiAPICall(ctx context.Context,
+	requestSpan opentracing.Span,
+	d diag.Sink, client httpClient, cloudAPI, method, path string, body []byte,
+	tok accessToken, opts httpCallOptions,
+) (string, *http.Response, error) {
 	// Normalize URL components
 	cloudAPI = strings.TrimSuffix(cloudAPI, "/")
 	path = cleanPath(path)
@@ -134,14 +246,14 @@ func pulumiAPICall(ctx context.Context, d diag.Sink, cloudAPI, method, path stri
 		writer := gzip.NewWriter(&buf)
 		defer contract.IgnoreClose(writer)
 		if _, err := writer.Write(body); err != nil {
-			return "", nil, errors.Wrapf(err, "compressing payload")
+			return "", nil, fmt.Errorf("compressing payload: %w", err)
 		}
 
 		// gzip.Writer will not actually write anything unless it is flushed,
 		//  and it will not actually write the GZip footer unless it is closed. (Close also flushes)
 		// Without this, the compressed bytes do not decompress properly e.g. in python.
 		if err := writer.Close(); err != nil {
-			return "", nil, errors.Wrapf(err, "closing compressed payload")
+			return "", nil, fmt.Errorf("closing compressed payload: %w", err)
 		}
 
 		logging.V(apiRequestDetailLogLevel).Infof("gzip compression ratio: %f, original size: %d bytes",
@@ -153,32 +265,33 @@ func pulumiAPICall(ctx context.Context, d diag.Sink, cloudAPI, method, path stri
 
 	req, err := http.NewRequest(method, url, bodyReader)
 	if err != nil {
-		return "", nil, errors.Wrapf(err, "creating new HTTP request")
+		return "", nil, fmt.Errorf("creating new HTTP request: %w", err)
 	}
 
-	requestSpan, requestContext := opentracing.StartSpanFromContext(ctx, getEndpointName(method, path),
-		opentracing.Tag{Key: "method", Value: method},
-		opentracing.Tag{Key: "path", Value: path},
-		opentracing.Tag{Key: "api", Value: cloudAPI},
-		opentracing.Tag{Key: "retry", Value: opts.RetryAllMethods})
-	defer requestSpan.Finish()
-
-	req = req.WithContext(requestContext)
+	req = req.WithContext(ctx)
 	req.Header.Set("Content-Type", "application/json")
+
+	// Set headers from the incoming options.
+	for k, v := range opts.Header {
+		req.Header[k] = v
+	}
 
 	// Add a User-Agent header to allow for the backend to make breaking API changes while preserving
 	// backwards compatibility.
-	userAgent := fmt.Sprintf("pulumi-cli/1 (%s; %s)", version.Version, runtime.GOOS)
-	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("User-Agent", UserAgent())
 	// Specify the specific API version we accept.
-	req.Header.Set("Accept", "application/vnd.pulumi+7")
+	req.Header.Set("Accept", "application/vnd.pulumi+8")
 
 	// Apply credentials if provided.
-	if tok.String() != "" {
-		req.Header.Set("Authorization", fmt.Sprintf("%s %s", tok.Kind(), tok.String()))
+	creds, err := tok.Get(ctx)
+	if err != nil {
+		return "", nil, fmt.Errorf("fetching credentials: %w", err)
+	}
+	if creds != "" {
+		req.Header.Set("Authorization", fmt.Sprintf("%s %s", tok.Kind(), creds))
 	}
 
-	tracingOptions := tracing.OptionsFromContext(requestContext)
+	tracingOptions := tracing.OptionsFromContext(ctx)
 	if tracingOptions.PropagateSpans {
 		carrier := opentracing.HTTPHeadersCarrier(req.Header)
 		if err = requestSpan.Tracer().Inject(requestSpan.Context(), opentracing.HTTPHeaders, carrier); err != nil {
@@ -202,15 +315,13 @@ func pulumiAPICall(ctx context.Context, d diag.Sink, cloudAPI, method, path stri
 			"Pulumi API call details (%s): headers=%v; body=%v", url, req.Header, string(body))
 	}
 
-	var resp *http.Response
-	if req.Method == "GET" || opts.RetryAllMethods {
-		resp, err = httputil.DoWithRetry(req, http.DefaultClient)
-	} else {
-		resp, err = http.DefaultClient.Do(req)
-	}
-
+	resp, err := client.Do(req, opts.RetryPolicy)
 	if err != nil {
-		return "", nil, errors.Wrapf(err, "performing HTTP request")
+		// Don't wrap *apitype.ErrorResponse.
+		if _, ok := err.(*apitype.ErrorResponse); ok {
+			return "", nil, err
+		}
+		return "", nil, fmt.Errorf("performing HTTP request: %w", err)
 	}
 	logging.V(apiRequestLogLevel).Infof("Pulumi API call response code (%s): %v", url, resp.Status)
 
@@ -222,45 +333,76 @@ func pulumiAPICall(ctx context.Context, d diag.Sink, cloudAPI, method, path stri
 		}
 	}
 
+	// Provide a better error if using an authenticated call without having logged in first.
+	if resp.StatusCode == 401 && tok.Kind() == accessTokenKindAPIToken && creds == "" {
+		return "", nil, errors.New("this command requires logging in; try running `pulumi login` first")
+	}
+
+	// Provide a better error if rate-limit is exceeded(429: Too Many Requests)
+	if resp.StatusCode == 429 {
+		return "", nil, errors.New("pulumi service: request rate-limit exceeded")
+	}
+
 	// For 4xx and 5xx failures, attempt to provide better diagnostics about what may have gone wrong.
 	if resp.StatusCode >= 400 && resp.StatusCode <= 599 {
 		// 4xx and 5xx responses should be of type ErrorResponse. See if we can unmarshal as that
 		// type, and if not just return the raw response text.
 		respBody, err := readBody(resp)
 		if err != nil {
-			return "", nil, errors.Wrapf(
-				err, "API call failed (%s), could not read response", resp.Status)
+			return "", nil, fmt.Errorf("API call failed (%s), could not read response: %w", resp.Status, err)
 		}
-
-		// Provide a better error if using an authenticated call without having logged in first.
-		if resp.StatusCode == 401 && tok.Kind() == accessTokenKindAPIToken && tok.String() == "" {
-			return "", nil, errors.New("this command requires logging in; try running 'pulumi login' first")
-		}
-
-		var errResp apitype.ErrorResponse
-		if err = json.Unmarshal(respBody, &errResp); err != nil {
-			errResp.Code = resp.StatusCode
-			errResp.Message = strings.TrimSpace(string(respBody))
-		}
-		return "", nil, &errResp
+		return "", nil, decodeError(respBody, resp.StatusCode, opts)
 	}
 
 	return url, resp, nil
 }
 
-// pulumiRESTCall calls the Pulumi REST API marshalling reqObj to JSON and using that as
+func decodeError(respBody []byte, statusCode int, opts httpCallOptions) error {
+	if opts.ErrorResponse != nil {
+		if err := json.Unmarshal(respBody, opts.ErrorResponse); err == nil {
+			return opts.ErrorResponse.(error)
+		}
+	}
+
+	var errResp apitype.ErrorResponse
+	if err := json.Unmarshal(respBody, &errResp); err != nil {
+		errResp.Code = statusCode
+		errResp.Message = strings.TrimSpace(string(respBody))
+	}
+	return &errResp
+}
+
+// restClient is an abstraction for calling the Pulumi REST API.
+type restClient interface {
+	Call(ctx context.Context, diag diag.Sink, cloudAPI, method, path string, queryObj, reqObj,
+		respObj interface{}, tok accessToken, opts httpCallOptions) error
+}
+
+// defaultRESTClient is the default implementation for calling the Pulumi REST API.
+type defaultRESTClient struct {
+	client httpClient
+}
+
+// Call calls the Pulumi REST API marshalling reqObj to JSON and using that as
 // the request body (use nil for GETs), and if successful, marshalling the responseObj
 // as JSON and storing it in respObj (use nil for NoContent). The error return type might
 // be an instance of apitype.ErrorResponse, in which case will have the response code.
-func pulumiRESTCall(ctx context.Context, diag diag.Sink, cloudAPI, method, path string, queryObj, reqObj,
-	respObj interface{}, tok accessToken, opts httpCallOptions) error {
+func (c *defaultRESTClient) Call(ctx context.Context, diag diag.Sink, cloudAPI, method, path string, queryObj, reqObj,
+	respObj interface{}, tok accessToken, opts httpCallOptions,
+) error {
+	requestSpan, ctx := opentracing.StartSpanFromContext(ctx, getEndpointName(method, path),
+		opentracing.Tag{Key: "method", Value: method},
+		opentracing.Tag{Key: "path", Value: path},
+		opentracing.Tag{Key: "api", Value: cloudAPI},
+		opentracing.Tag{Key: "retry", Value: opts.RetryPolicy.String()})
+	defer requestSpan.Finish()
 
 	// Compute query string from query object
 	querystring := ""
 	if queryObj != nil {
 		queryValues, err := query.Values(queryObj)
 		if err != nil {
-			return errors.Wrapf(err, "marshalling query object as JSON")
+			return fmt.Errorf("marshalling query object as JSON: %w", err)
 		}
 		query := queryValues.Encode()
 		if len(query) > 0 {
@@ -272,38 +414,49 @@ func pulumiRESTCall(ctx context.Context, diag diag.Sink, cloudAPI, method, path 
 	var reqBody []byte
 	var err error
 	if reqObj != nil {
-		reqBody, err = json.Marshal(reqObj)
-		if err != nil {
-			return errors.Wrapf(err, "marshalling request object as JSON")
+		// Send verbatim if already marshalled. This is
+		// important when sending indented JSON is needed.
+		if raw, ok := reqObj.(json.RawMessage); ok {
+			reqBody = []byte(raw)
+		} else {
+			reqBody, err = json.Marshal(reqObj)
+			if err != nil {
+				return fmt.Errorf("marshalling request object as JSON: %w", err)
+			}
 		}
 	}
 
 	// Make API call
-	url, resp, err := pulumiAPICall(ctx, diag, cloudAPI, method, path+querystring, reqBody, tok, opts)
+	url, resp, err := pulumiAPICall(
+		ctx, requestSpan, diag, c.client, cloudAPI, method, path+querystring, reqBody, tok, opts)
 	if err != nil {
 		return err
+	}
+	if respPtr, ok := respObj.(**http.Response); ok {
+		*respPtr = resp
+		return nil
 	}
 
 	// Read API response
 	respBody, err := readBody(resp)
 	if err != nil {
-		return errors.Wrapf(err, "reading response from API")
+		return fmt.Errorf("reading response from API: %w", err)
 	}
 	if logging.V(apiRequestDetailLogLevel) {
 		logging.V(apiRequestDetailLogLevel).Infof("Pulumi API call response body (%s): %v", url, string(respBody))
 	}
 
 	if respObj != nil {
-		bytes := reflect.TypeOf([]byte(nil))
-		if typ := reflect.TypeOf(respObj); typ == reflect.PtrTo(bytes) {
+		switch respObj := respObj.(type) {
+		case *[]byte:
 			// Return the raw bytes of the response body.
-			*respObj.(*[]byte) = respBody
-		} else if typ == bytes {
-			return fmt.Errorf("Can't unmarshal response body to []byte. Try *[]byte")
-		} else {
+			*respObj = respBody
+		case []byte:
+			return errors.New("Can't unmarshal response body to []byte. Try *[]byte")
+		default:
 			// Else, unmarshal as JSON.
 			if err = json.Unmarshal(respBody, respObj); err != nil {
-				return errors.Wrapf(err, "unmarshalling response object")
+				return fmt.Errorf("unmarshalling response object: %w", err)
 			}
 		}
 	}
@@ -318,12 +471,12 @@ func readBody(resp *http.Response) ([]byte, error) {
 	defer contract.IgnoreClose(resp.Body)
 	if !ok {
 		// No header implies that there's no additional encoding on this response.
-		return ioutil.ReadAll(resp.Body)
+		return io.ReadAll(resp.Body)
 	}
 
 	if len(contentEncoding) > 1 {
 		// We only know how to deal with gzip. We can't handle additional encodings layered on top of it.
-		return nil, errors.Errorf("can't handle content encodings %v", contentEncoding)
+		return nil, fmt.Errorf("can't handle content encodings %v", contentEncoding)
 	}
 
 	switch contentEncoding[0] {
@@ -337,11 +490,11 @@ func readBody(resp *http.Response) ([]byte, error) {
 			defer contract.IgnoreClose(reader)
 		}
 		if err != nil {
-			return nil, errors.Wrap(err, "reading gzip-compressed body")
+			return nil, fmt.Errorf("reading gzip-compressed body: %w", err)
 		}
 
-		return ioutil.ReadAll(reader)
+		return io.ReadAll(reader)
 	default:
-		return nil, errors.Errorf("unrecognized encoding %s", contentEncoding[0])
+		return nil, fmt.Errorf("unrecognized encoding %s", contentEncoding[0])
 	}
 }

@@ -1,3 +1,17 @@
+// Copyright 2020-2024, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package workspace
 
 import (
@@ -7,23 +21,47 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+//nolint:paralleltest // mutates environment
 func TestConcurrentCredentialsWrites(t *testing.T) {
-	creds, err := GetStoredCredentials()
+	// save and remember to restore creds in ~/.pulumi/credentials
+	// as the test will be modifying them
+	oldCreds, err := GetStoredCredentials()
+	assert.NoError(t, err)
+	defer func() {
+		err := StoreCredentials(oldCreds)
+		assert.NoError(t, err)
+	}()
+
+	// use test creds that have at least 1 AccessToken to force a
+	// disk write and contention
+	testCreds := Credentials{
+		AccessTokens: map[string]string{
+			"token-name": "token-value",
+		},
+	}
+
+	// using 1000 may trigger sporadic 'Too many open files'
+	n := 256
+
+	wg := &sync.WaitGroup{}
+	wg.Add(2 * n)
+
+	// Store testCreds initially so asserts in
+	// GetStoredCredentials goroutines find the expected data
+	err = StoreCredentials(testCreds)
 	assert.NoError(t, err)
 
-	var wg sync.WaitGroup
-
-	for i := 0; i < 1000; i++ {
-		wg.Add(2)
+	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
-			err := StoreCredentials(creds)
+			err := StoreCredentials(testCreds)
 			assert.NoError(t, err)
 		}()
 		go func() {
 			defer wg.Done()
-			_, err := GetStoredCredentials()
+			creds, err := GetStoredCredentials()
 			assert.NoError(t, err)
+			assert.Equal(t, "token-value", creds.AccessTokens["token-name"])
 		}()
 	}
 	wg.Wait()

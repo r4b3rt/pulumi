@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2022, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,23 +15,25 @@
 package stack
 
 import (
+	"context"
 	"encoding/json"
-
-	"github.com/pkg/errors"
+	"fmt"
 
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype/migrate"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/encoding"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 )
 
-func UnmarshalVersionedCheckpointToLatestCheckpoint(bytes []byte) (*apitype.CheckpointV3, error) {
+func UnmarshalVersionedCheckpointToLatestCheckpoint(m encoding.Marshaler, bytes []byte) (*apitype.CheckpointV3, error) {
 	var versionedCheckpoint apitype.VersionedCheckpoint
-	if err := json.Unmarshal(bytes, &versionedCheckpoint); err != nil {
-		return nil, err
+	// Here we are careful to unmarshal `bytes` with the provided unmarshaller `m`.
+	if err := m.Unmarshal(bytes, &versionedCheckpoint); err != nil {
+		return nil, fmt.Errorf("place 1: %w", err)
 	}
 
 	switch versionedCheckpoint.Version {
@@ -41,7 +43,7 @@ func UnmarshalVersionedCheckpointToLatestCheckpoint(bytes []byte) (*apitype.Chec
 		// After we upgrade, we could consider rewriting this code to use DisallowUnknownFields() on the decoder
 		// to have the old checkpoint not even deserialize as an apitype.VersionedCheckpoint.
 		var v1checkpoint apitype.CheckpointV1
-		if err := json.Unmarshal(bytes, &v1checkpoint); err != nil {
+		if err := m.Unmarshal(bytes, &v1checkpoint); err != nil {
 			return nil, err
 		}
 
@@ -73,29 +75,53 @@ func UnmarshalVersionedCheckpointToLatestCheckpoint(bytes []byte) (*apitype.Chec
 
 		return &v3checkpoint, nil
 	default:
-		return nil, errors.Errorf("unsupported checkpoint version %d", versionedCheckpoint.Version)
+		return nil, fmt.Errorf("unsupported checkpoint version %d", versionedCheckpoint.Version)
 	}
+}
+
+func MarshalUntypedDeploymentToVersionedCheckpoint(
+	stack tokens.QName, deployment *apitype.UntypedDeployment,
+) (*apitype.VersionedCheckpoint, error) {
+	chk := struct {
+		Stack  tokens.QName
+		Latest json.RawMessage
+	}{
+		Stack:  stack,
+		Latest: deployment.Deployment,
+	}
+
+	bytes, err := encoding.JSON.Marshal(chk)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling checkpoint: %w", err)
+	}
+
+	return &apitype.VersionedCheckpoint{
+		Version:    deployment.Version,
+		Checkpoint: bytes,
+	}, nil
 }
 
 // SerializeCheckpoint turns a snapshot into a data structure suitable for serialization.
 func SerializeCheckpoint(stack tokens.QName, snap *deploy.Snapshot,
-	sm secrets.Manager, showSecrets bool) (*apitype.VersionedCheckpoint, error) {
+	showSecrets bool,
+) (*apitype.VersionedCheckpoint, error) {
 	// If snap is nil, that's okay, we will just create an empty deployment; otherwise, serialize the whole snapshot.
 	var latest *apitype.DeploymentV3
 	if snap != nil {
-		dep, err := SerializeDeployment(snap, sm, showSecrets)
+		ctx := context.TODO()
+		dep, err := SerializeDeployment(ctx, snap, showSecrets)
 		if err != nil {
-			return nil, errors.Wrap(err, "serializing deployment")
+			return nil, fmt.Errorf("serializing deployment: %w", err)
 		}
 		latest = dep
 	}
 
-	b, err := json.Marshal(apitype.CheckpointV3{
+	b, err := encoding.JSON.Marshal(apitype.CheckpointV3{
 		Stack:  stack,
 		Latest: latest,
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "marshalling checkpoint")
+		return nil, fmt.Errorf("marshalling checkpoint: %w", err)
 	}
 
 	return &apitype.VersionedCheckpoint{
@@ -106,10 +132,14 @@ func SerializeCheckpoint(stack tokens.QName, snap *deploy.Snapshot,
 
 // DeserializeCheckpoint takes a serialized deployment record and returns its associated snapshot. Returns nil
 // if there have been no deployments performed on this checkpoint.
-func DeserializeCheckpoint(chkpoint *apitype.CheckpointV3) (*deploy.Snapshot, error) {
-	contract.Require(chkpoint != nil, "chkpoint")
+func DeserializeCheckpoint(
+	ctx context.Context,
+	secretsProvider secrets.Provider,
+	chkpoint *apitype.CheckpointV3,
+) (*deploy.Snapshot, error) {
+	contract.Requiref(chkpoint != nil, "chkpoint", "must not be nil")
 	if chkpoint.Latest != nil {
-		return DeserializeDeploymentV3(*chkpoint.Latest, DefaultSecretsProvider)
+		return DeserializeDeploymentV3(ctx, *chkpoint.Latest, secretsProvider)
 	}
 
 	return nil, nil
@@ -119,10 +149,19 @@ func DeserializeCheckpoint(chkpoint *apitype.CheckpointV3) (*deploy.Snapshot, er
 func GetRootStackResource(snap *deploy.Snapshot) (*resource.State, error) {
 	if snap != nil {
 		for _, res := range snap.Resources {
-			if res.Type == resource.RootStackType {
+			if res.Type == resource.RootStackType && res.Parent == "" {
 				return res, nil
 			}
 		}
 	}
 	return nil, nil
+}
+
+// CreateRootStackResource creates a new root stack resource with the given name
+func CreateRootStackResource(stackName tokens.QName, projectName tokens.PackageName) *resource.State {
+	typ, name := resource.RootStackType, fmt.Sprintf("%s-%s", projectName, stackName)
+	urn := resource.NewURN(stackName, projectName, "", typ, name)
+	state := resource.NewState(typ, urn, false, false, "", resource.PropertyMap{}, nil, "", false, false, nil, nil, "",
+		nil, false, nil, nil, nil, "", false, "", nil, nil, "", nil)
+	return state
 }

@@ -15,7 +15,7 @@
 // Pulling out some of the repeated strings tokens into constants would harm readability, so we just ignore the
 // goconst linter's warning.
 //
-// nolint: lll, goconst
+//nolint:lll, goconst
 package gen
 
 import (
@@ -28,6 +28,7 @@ import (
 
 var testPackageSpec = schema.PackageSpec{
 	Name:        "aws",
+	Version:     "0.0.1",
 	Description: "A fake provider package used for testing.",
 	Meta: &schema.MetadataSpec{
 		ModuleFormat: "(.*)(?:/[^/]*)",
@@ -70,9 +71,13 @@ func getTestPackage(t *testing.T) *schema.Package {
 }
 
 func TestGetDocLinkForPulumiType(t *testing.T) {
+	t.Parallel()
+
 	pkg := getTestPackage(t)
 	d := DocLanguageHelper{}
 	t.Run("Generate_ResourceOptionsLink_Specified", func(t *testing.T) {
+		t.Parallel()
+
 		pkg.Language["go"] = GoPackageInfo{PulumiSDKVersion: 1}
 		expected := "https://pkg.go.dev/github.com/pulumi/pulumi/sdk/go/pulumi?tab=doc#ResourceOption"
 		link := d.GetDocLinkForPulumiType(pkg, "ResourceOption")
@@ -80,6 +85,8 @@ func TestGetDocLinkForPulumiType(t *testing.T) {
 		pkg.Language["go"] = nil
 	})
 	t.Run("Generate_ResourceOptionsLink_Specified", func(t *testing.T) {
+		t.Parallel()
+
 		pkg.Language["go"] = GoPackageInfo{PulumiSDKVersion: 2}
 		expected := "https://pkg.go.dev/github.com/pulumi/pulumi/sdk/v2/go/pulumi?tab=doc#ResourceOption"
 		link := d.GetDocLinkForPulumiType(pkg, "ResourceOption")
@@ -87,6 +94,8 @@ func TestGetDocLinkForPulumiType(t *testing.T) {
 		pkg.Language["go"] = nil
 	})
 	t.Run("Generate_ResourceOptionsLink_Unspecified", func(t *testing.T) {
+		t.Parallel()
+
 		expected := fmt.Sprintf("https://pkg.go.dev/github.com/pulumi/pulumi/sdk/%s/go/pulumi?tab=doc#ResourceOption", pulumiSDKVersion)
 		link := d.GetDocLinkForPulumiType(pkg, "ResourceOption")
 		assert.Equal(t, expected, link)
@@ -94,6 +103,8 @@ func TestGetDocLinkForPulumiType(t *testing.T) {
 }
 
 func TestGetDocLinkForResourceType(t *testing.T) {
+	t.Parallel()
+
 	pkg := getTestPackage(t)
 	d := DocLanguageHelper{}
 	expected := "https://pkg.go.dev/github.com/pulumi/pulumi-aws/sdk/go/aws/s3?tab=doc#Bucket"

@@ -15,7 +15,7 @@
 // Pulling out some of the repeated strings tokens into constants would harm readability,
 // so we just ignore the goconst linter's warning.
 //
-// nolint: lll, goconst
+//nolint:lll, goconst
 package python
 
 import (
@@ -55,7 +55,7 @@ func (d DocLanguageHelper) GetDocLinkForResourceType(pkg *schema.Package, modNam
 		path = modName
 		fqdnTypeName = fmt.Sprintf("%s.%s", modName, typeName)
 	case pkg.Name != "" && modName == "":
-		path = fmt.Sprintf("pulumi_%s", pkg.Name)
+		path = "pulumi_" + pkg.Name
 		fqdnTypeName = fmt.Sprintf("pulumi_%s.%s", pkg.Name, typeName)
 	}
 
@@ -76,11 +76,11 @@ func (d DocLanguageHelper) GetDocLinkForFunctionInputOrOutputType(pkg *schema.Pa
 func (d DocLanguageHelper) GetLanguageTypeString(pkg *schema.Package, moduleName string, t schema.Type, input bool) string {
 	typeDetails := map[*schema.ObjectType]*typeDetails{}
 	mod := &modContext{
-		pkg:         pkg,
+		pkg:         pkg.Reference(),
 		mod:         moduleName,
 		typeDetails: typeDetails,
 	}
-	typeName := mod.typeString(t, input, false /*acceptMapping*/)
+	typeName := mod.typeString(t, input, false /*acceptMapping*/, false /*forDict*/)
 
 	// Remove any package qualifiers from the type name.
 	if !input {
@@ -103,16 +103,32 @@ func (d DocLanguageHelper) GetResourceFunctionResultName(modName string, f *sche
 	return title(tokenToName(f.Token)) + "Result"
 }
 
-// GenPropertyCaseMap generates the case maps for a property.
-func (d DocLanguageHelper) GenPropertyCaseMap(pkg *schema.Package, modName, tool string, prop *schema.Property, snakeCaseToCamelCase, camelCaseToSnakeCase map[string]string, seenTypes codegen.Set) {
-	if _, imported := pkg.Language["python"]; !imported {
-		if err := pkg.ImportLanguages(map[string]schema.Language{"python": Importer}); err != nil {
-			fmt.Printf("error building case map for %q in module %q", prop.Name, modName)
-			return
+func (d DocLanguageHelper) GetMethodName(m *schema.Method) string {
+	return PyName(m.Name)
+}
+
+func (d DocLanguageHelper) GetMethodResultName(pkg *schema.Package, modName string, r *schema.Resource,
+	m *schema.Method,
+) string {
+	var returnType *schema.ObjectType
+	if m.Function.ReturnType != nil {
+		if objectType, ok := m.Function.ReturnType.(*schema.ObjectType); ok && objectType != nil {
+			returnType = objectType
 		}
 	}
 
-	recordProperty(prop, snakeCaseToCamelCase, camelCaseToSnakeCase, seenTypes)
+	if info, ok := pkg.Language["python"].(PackageInfo); ok {
+		if info.LiftSingleValueMethodReturns && returnType != nil && len(returnType.Properties) == 1 {
+			typeDetails := map[*schema.ObjectType]*typeDetails{}
+			mod := &modContext{
+				pkg:         pkg.Reference(),
+				mod:         modName,
+				typeDetails: typeDetails,
+			}
+			return mod.typeString(returnType.Properties[0].Type, false, false, false /*forDict*/)
+		}
+	}
+	return fmt.Sprintf("%s.%sResult", resourceName(r), title(d.GetMethodName(m)))
 }
 
 // GetPropertyName returns the property name specific to Python.
@@ -138,6 +154,6 @@ func (d DocLanguageHelper) GetModuleDocLink(pkg *schema.Package, modName string)
 	} else {
 		displayName = fmt.Sprintf("%s/%s", pyPack(pkg.Name), strings.ToLower(modName))
 	}
-	link = fmt.Sprintf("/docs/reference/pkg/python/%s", displayName)
+	link = "/docs/reference/pkg/python/" + displayName
 	return displayName, link
 }

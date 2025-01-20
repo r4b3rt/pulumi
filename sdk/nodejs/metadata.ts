@@ -14,17 +14,23 @@
 
 // This file exports metadata about the context in which a program is being run.
 
-import * as runtime from "./runtime";
+import * as settings from "./runtime/settings";
 
 /**
- * getProject returns the current project name.  It throws an exception if none is registered.
+ * Returns the current organization name.
  */
-export function getProject(): string {
-    return runtime.getProject();
+export function getOrganization(): string {
+    return settings.getOrganization();
 }
 /**
- * getStack returns the current stack name.  It throws an exception if none is registered.
+ * Returns the current project name. Throws an exception if none is registered.
+ */
+export function getProject(): string {
+    return settings.getProject();
+}
+/**
+ * Returns the current stack name. Throws an exception if none is registered.
  */
 export function getStack(): string {
-    return runtime.getStack();
+    return settings.getStack();
 }

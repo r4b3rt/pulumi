@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2021, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,148 +15,283 @@
 import * as grpc from "@grpc/grpc-js";
 import * as fs from "fs";
 import * as path from "path";
-import { ComponentResource, URN } from "../resource";
+import { ComponentResource } from "../resource";
+import { CallbackServer, ICallbackServer } from "./callbacks";
 import { debuggablePromise } from "./debuggable";
+import { getLocalStore, getStore } from "./state";
 
-const engrpc = require("../proto/engine_grpc_pb.js");
-const engproto = require("../proto/engine_pb.js");
-const provproto = require("../proto/provider_pb.js");
-const resrpc = require("../proto/resource_grpc_pb.js");
-const resproto = require("../proto/resource_pb.js");
-const structproto = require("google-protobuf/google/protobuf/struct_pb.js");
+import * as engrpc from "../proto/engine_grpc_pb";
+import * as engproto from "../proto/engine_pb";
+import * as resrpc from "../proto/resource_grpc_pb";
+import * as resproto from "../proto/resource_pb";
 
-// maxRPCMessageSize raises the gRPC Max Message size from `4194304` (4mb) to `419430400` (400mb)
+/**
+ * Raises the gRPC Max Message size from `4194304` (4mb) to `419430400` (400mb).
+ *
+ * @internal
+ */
 export const maxRPCMessageSize: number = 1024 * 1024 * 400;
 const grpcChannelOptions = { "grpc.max_receive_message_length": maxRPCMessageSize };
 
 /**
- * excessiveDebugOutput enables, well, pretty excessive debug output pertaining to resources and properties.
+ * excessiveDebugOutput enables, well, pretty excessive debug output pertaining
+ * to resources and properties.
  */
-export let excessiveDebugOutput: boolean = false;
+export const excessiveDebugOutput: boolean = false;
 
 /**
- * Options is a bag of settings that controls the behavior of previews and deployments
+ * {@link Options} is a bag of settings that controls the behavior of previews
+ * and deployments.
  */
 export interface Options {
-    readonly project?: string; // the name of the current project.
-    readonly stack?: string; // the name of the current stack being deployed into.
-    readonly parallel?: number; // the degree of parallelism for resource operations (default is serial).
-    readonly engineAddr?: string; // a connection string to the engine's RPC, in case we need to reestablish.
-    readonly monitorAddr?: string; // a connection string to the monitor's RPC, in case we need to reestablish.
-    readonly dryRun?: boolean; // whether we are performing a preview (true) or a real deployment (false).
-    readonly testModeEnabled?: boolean; // true if we're in testing mode (allows execution without the CLI).
-    readonly queryMode?: boolean; // true if we're in query mode (does not allow resource registration).
-    readonly legacyApply?: boolean; // true if we will resolve missing outputs to inputs during preview.
-    readonly cacheDynamicProviders?: boolean; // true if we will cache serialized dynamic providers on the program side.
+    /**
+     * The name of the current project.
+     */
+    readonly project?: string;
 
     /**
-     * Directory containing the send/receive files for making synchronous invokes to the engine.
+     * The name of the current stack being deployed into.
+     */
+    readonly stack?: string;
+
+    /**
+     * The degree of parallelism for resource operations (default is serial).
+     */
+    readonly parallel?: number;
+
+    /**
+     * A connection string to the engine's RPC, in case we need to reestablish.
+     */
+    readonly engineAddr?: string;
+
+    /**
+     * A connection string to the monitor's RPC, in case we need to reestablish.
+     */
+    readonly monitorAddr?: string;
+
+    /**
+     * Whether we are performing a preview (true) or a real deployment (false).
+     */
+    readonly dryRun?: boolean;
+
+    /**
+     * True if we're in testing mode (allows execution without the CLI).
+     */
+    readonly testModeEnabled?: boolean;
+
+    /**
+     * True if we're in query mode (does not allow resource registration).
+     */
+    readonly queryMode?: boolean;
+
+    /**
+     * True if we will resolve missing outputs to inputs during preview.
+     */
+    readonly legacyApply?: boolean;
+
+    /**
+     * True if we will cache serialized dynamic providers on the program side.
+     */
+    readonly cacheDynamicProviders?: boolean;
+
+    /**
+     * The name of the current organization.
+     */
+    readonly organization?: string;
+
+    /**
+     * A directory containing the send/receive files for making synchronous
+     * invokes to the engine.
      */
     readonly syncDir?: string;
 }
 
-const nodeEnvKeys = {
-    project: "PULUMI_NODEJS_PROJECT",
-    stack: "PULUMI_NODEJS_STACK",
-    dryRun: "PULUMI_NODEJS_DRY_RUN",
-    queryMode: "PULUMI_NODEJS_QUERY_MODE",
-    parallel: "PULUMI_NODEJS_PARALLEL",
-    monitorAddr: "PULUMI_NODEJS_MONITOR",
-    engineAddr: "PULUMI_NODEJS_ENGINE",
-    syncDir: "PULUMI_NODEJS_SYNC",
-    // this value is not set by the CLI and is controlled via a user set env var unlike the values above
-    cacheDynamicProviders: "PULUMI_NODEJS_CACHE_DYNAMIC_PROVIDERS",
-};
+let monitor: resrpc.ResourceMonitorClient | undefined;
+let engine: engrpc.EngineClient | undefined;
 
-const pulumiEnvKeys = {
-    testMode: "PULUMI_TEST_MODE",
-    legacyApply: "PULUMI_ENABLE_LEGACY_APPLY",
-};
-
-// reset options resets nodejs runtime global state (such as rpc clients),
-// and sets nodejs runtime option env vars to the specified values.
+/**
+ * Resets NodeJS runtime global state (such as RPC clients), and sets NodeJS
+ * runtime option environment variables to the specified values.
+ */
 export function resetOptions(
-    project: string, stack: string, parallel: number, engineAddr: string,
-    monitorAddr: string, preview: boolean) {
+    project: string,
+    stack: string,
+    parallel: number,
+    engineAddr: string,
+    monitorAddr: string,
+    preview: boolean,
+    organization: string,
+) {
+    const store = getStore();
 
     monitor = undefined;
     engine = undefined;
-    rootResource = undefined;
-    rpcDone = Promise.resolve();
-    featureSupport = {};
+
+    store.settings.monitor = undefined;
+    store.settings.engine = undefined;
+    store.settings.rpcDone = Promise.resolve();
+    store.settings.featureSupport = {};
 
     // reset node specific environment variables in the process
-    process.env[nodeEnvKeys.project] = project;
-    process.env[nodeEnvKeys.stack] = stack;
-    process.env[nodeEnvKeys.dryRun] = preview.toString();
-    process.env[nodeEnvKeys.queryMode] = isQueryMode.toString();
-    process.env[nodeEnvKeys.parallel] = parallel.toString();
-    process.env[nodeEnvKeys.monitorAddr] = monitorAddr;
-    process.env[nodeEnvKeys.engineAddr] = engineAddr;
+    store.settings.options.project = project;
+    store.settings.options.stack = stack;
+    store.settings.options.dryRun = preview;
+    store.settings.options.queryMode = isQueryMode();
+    store.settings.options.parallel = parallel;
+    store.settings.options.monitorAddr = monitorAddr;
+    store.settings.options.engineAddr = engineAddr;
+    store.settings.options.organization = organization;
+
+    store.leakCandidates = new Set<Promise<any>>();
+    store.logErrorCount = 0;
+    store.stackResource = undefined;
+    store.supportsSecrets = false;
+    store.supportsResourceReferences = false;
+    store.supportsOutputValues = false;
+    store.supportsDeletedWith = false;
+    store.supportsAliasSpecs = false;
+    store.supportsTransforms = false;
+    store.supportsInvokeTransforms = false;
+    store.supportsParameterization = false;
+    store.callbacks = undefined;
 }
 
-export function setMockOptions(mockMonitor: any, project?: string, stack?: string, preview?: boolean) {
+export function setMockOptions(
+    mockMonitor: any,
+    project?: string,
+    stack?: string,
+    preview?: boolean,
+    organization?: string,
+) {
     const opts = options();
     resetOptions(
         project || opts.project || "project",
         stack || opts.stack || "stack",
         opts.parallel || -1,
         opts.engineAddr || "",
-        opts.monitorAddr || "",
+        "mock",
         preview || false,
+        organization || "",
     );
 
+    const { settings } = getStore();
+    settings.monitor = mockMonitor;
     monitor = mockMonitor;
 }
 
-/** @internal Used only for testing purposes. */
+/**
+ * @internal
+ *  Used only for testing purposes.
+ */
 export function _setIsDryRun(val: boolean) {
-    process.env[nodeEnvKeys.dryRun] = val.toString();
+    const { settings } = getStore();
+    settings.options.dryRun = val;
 }
 
 /**
- * Returns true if we're currently performing a dry-run, or false if this is a true update. Note that we
- * always consider executions in test mode to be "dry-runs", since we will never actually carry out an update,
- * and therefore certain output properties will never be resolved.
+ * Returns true if we are currently doing a preview.
+ *
+ * When writing unit tests, you can set this flag via either `setMocks` or
+ * `_setIsDryRun`.
  */
 export function isDryRun(): boolean {
     return options().dryRun === true;
 }
 
-/** @internal Used only for testing purposes */
-export function _reset() {
-    resetOptions("", "", -1, "", "", false);
-}
+/**
+ * Returns a promise that when resolved tells you if the resource monitor we are
+ * connected to is able to support a particular feature.
+ *
+ * @internal
+ */
+async function monitorSupportsFeature(monitorClient: resrpc.IResourceMonitorClient, feature: string): Promise<boolean> {
+    const req = new resproto.SupportsFeatureRequest();
+    req.setId(feature);
 
-/** @internal Used only for testing purposes */
-export function _setTestModeEnabled(val: boolean) {
-    process.env[pulumiEnvKeys.testMode] = val.toString();
-}
+    const result = await new Promise<boolean>((resolve, reject) => {
+        monitorClient.supportsFeature(
+            req,
+            (err: grpc.ServiceError | null, resp: resproto.SupportsFeatureResponse | undefined) => {
+                // Back-compat case - if the monitor doesn't let us ask if it supports a feature, it doesn't support
+                // any features.
+                if (err && err.code === grpc.status.UNIMPLEMENTED) {
+                    return resolve(false);
+                }
 
-/** @internal Used only for testing purposes */
-export function _setFeatureSupport(key: string, val: boolean) {
-    featureSupport[key] = val;
+                if (err) {
+                    return reject(err);
+                }
+
+                if (resp === undefined) {
+                    return reject(new Error("No response from resource monitor"));
+                }
+
+                return resolve(resp.getHassupport());
+            },
+        );
+    });
+
+    return result;
 }
 
 /**
- * Returns true if test mode is enabled (PULUMI_TEST_MODE).
- */
-export function isTestModeEnabled(): boolean {
-    return options().testModeEnabled === true;
-}
+ * Queries the resource monitor for its capabilities and sets the appropriate
+ * flags in the store.
+ *
+ * @internal
+ **/
+export async function awaitFeatureSupport(): Promise<void> {
+    const monitorRef = getMonitor();
+    if (monitorRef !== undefined) {
+        const store = getStore();
+        const [
+            secrets,
+            resourceReferences,
+            outputValues,
+            deletedWith,
+            aliasSpecs,
+            transforms,
+            invokeTransforms,
+            parameterization,
+        ] = await Promise.all(
+            [
+                "secrets",
+                "resourceReferences",
+                "outputValues",
+                "deletedWith",
+                "aliasSpecs",
+                "transforms",
+                "invokeTransforms",
+                "parameterization",
+            ].map((feature) => monitorSupportsFeature(monitorRef, feature)),
+        );
 
-/**
- * Checks that test mode is enabled and, if not, throws an error.
- */
-function requireTestModeEnabled(): void {
-    if (!isTestModeEnabled()) {
-        throw new Error("Program run without the Pulumi engine available; re-run using the `pulumi` CLI");
+        store.supportsSecrets = secrets;
+        store.supportsResourceReferences = resourceReferences;
+        store.supportsOutputValues = outputValues;
+        store.supportsDeletedWith = deletedWith;
+        store.supportsAliasSpecs = aliasSpecs;
+        store.supportsTransforms = transforms;
+        store.supportsInvokeTransforms = invokeTransforms;
+        store.supportsParameterization = parameterization;
     }
 }
 
-/** @internal Used only for testing purposes. */
+/**
+ * @internal
+ *  Used only for testing purposes.
+ */
 export function _setQueryMode(val: boolean) {
-    process.env[nodeEnvKeys.queryMode] = val.toString();
+    const { settings } = getStore();
+    settings.options.queryMode = val;
+}
+
+/**
+ * @internal
+ *  Used only for testing purposes.
+ */
+export function _reset(): void {
+    resetOptions("", "", -1, "", "", false, "");
 }
 
 /**
@@ -167,98 +302,156 @@ export function isQueryMode(): boolean {
 }
 
 /**
- * Returns true if we will resolve missing outputs to inputs during preview (PULUMI_ENABLE_LEGACY_APPLY).
+ * Returns true if we will resolve missing outputs to inputs during preview
+ * (`PULUMI_ENABLE_LEGACY_APPLY`).
  */
 export function isLegacyApplyEnabled(): boolean {
     return options().legacyApply === true;
 }
 
 /**
- * Returns true (default) if we will cache serialized dynamic providers on the program side
+ * Returns true if we will cache serialized dynamic providers on the program
+ * side (the default is true).
  */
 export function cacheDynamicProviders(): boolean {
     return options().cacheDynamicProviders === true;
 }
 
 /**
+ * Get the organization being run by the current update.
+ */
+export function getOrganization(): string {
+    const organization = options().organization;
+    if (organization) {
+        return organization;
+    }
+
+    // If the organization is missing, specialize the error.
+    // Throw an error if test mode is enabled, instructing how to manually configure the organization:
+    throw new Error("Missing organization name; for test mode, please call `pulumi.runtime.setMocks`");
+}
+
+/**
+ * @internal
+ *  Used only for testing purposes.
+ */
+export function _setOrganization(val: string | undefined) {
+    const { settings } = getStore();
+    settings.options.organization = val;
+    return settings.options.organization;
+}
+
+/**
  * Get the project being run by the current update.
  */
 export function getProject(): string {
-    const project = options().project;
-    if (project) {
-        return project;
-    }
-
-    // If the project is missing, specialize the error. First, if test mode is disabled:
-    requireTestModeEnabled();
-
-    // And now an error if test mode is enabled, instructing how to manually configure the project:
-    throw new Error("Missing project name; for test mode, please call `pulumi.runtime.setMocks`");
+    const { project } = options();
+    return project || "";
 }
 
-/** @internal Used only for testing purposes. */
+/**
+ * @internal
+ *  Used only for testing purposes.
+ */
 export function _setProject(val: string | undefined) {
-    process.env[nodeEnvKeys.project] = val;
+    const { settings } = getStore();
+    settings.options.project = val;
+    return settings.options.project;
 }
 
 /**
  * Get the stack being targeted by the current update.
  */
 export function getStack(): string {
-    const stack = options().stack;
-    if (stack) {
-        return stack;
-    }
-
-    // If the stack is missing, specialize the error. First, if test mode is disabled:
-    requireTestModeEnabled();
-
-    // And now an error if test mode is enabled, instructing how to manually configure the stack:
-    throw new Error("Missing stack name; for test mode, please set PULUMI_NODEJS_STACK");
-}
-
-/** @internal Used only for testing purposes. */
-export function _setStack(val: string | undefined) {
-    process.env[nodeEnvKeys.stack] = val;
+    const { stack } = options();
+    return stack || "";
 }
 
 /**
- * monitor is a live connection to the resource monitor that tracks deployments (lazily initialized).
+ * @internal
+ *  Used only for testing purposes.
  */
-let monitor: any | undefined;
-let featureSupport: Record<string, boolean> = {};
+export function _setStack(val: string | undefined) {
+    const { settings } = getStore();
+    settings.options.stack = val;
+    return settings.options.stack;
+}
 
 /**
- * hasMonitor returns true if we are currently connected to a resource monitoring service.
+ * Returns true if we are currently connected to a resource monitoring service.
  */
 export function hasMonitor(): boolean {
-    return !!monitor && !!options().monitorAddr;
+    const { settings } = getStore();
+    return (!!monitor && !!options().monitorAddr) || !!settings.monitor;
 }
 
 /**
- * getMonitor returns the current resource monitoring service client for RPC communications.
+ * Returns the current resource monitoring service client for RPC
+ * communications.
  */
-export function getMonitor(): Object | undefined {
-    // pre-emptive fail fast check for node inline programs
-    runSxSCheck();
-    if (monitor === undefined) {
-        const addr = options().monitorAddr;
-        if (addr) {
-            // Lazily initialize the RPC connection to the monitor.
-            monitor = new resrpc.ResourceMonitorClient(
-                addr,
-                grpc.credentials.createInsecure(),
-                grpcChannelOptions,
-            );
-        } else {
-            // If test mode isn't enabled, we can't run the program without an engine.
-            requireTestModeEnabled();
+export function getMonitor(): resrpc.IResourceMonitorClient | undefined {
+    const { settings } = getStore();
+    const addr = options().monitorAddr;
+    if (getLocalStore() === undefined && addr !== "mock") {
+        if (monitor === undefined) {
+            if (addr) {
+                // Lazily initialize the RPC connection to the monitor.
+                monitor = new resrpc.ResourceMonitorClient(addr, grpc.credentials.createInsecure(), grpcChannelOptions);
+                settings.options.monitorAddr = addr;
+            }
         }
+        return monitor;
+    } else {
+        if (settings.monitor === undefined) {
+            if (addr) {
+                // Lazily initialize the RPC connection to the monitor.
+                settings.monitor = new resrpc.ResourceMonitorClient(
+                    addr,
+                    grpc.credentials.createInsecure(),
+                    grpcChannelOptions,
+                );
+                settings.options.monitorAddr = addr;
+            }
+        }
+        return settings.monitor;
     }
-    return monitor;
 }
 
-/** @internal */
+/**
+ * Waits for any pending stack transforms to register.
+ */
+export async function awaitStackRegistrations(): Promise<void> {
+    const store = getStore();
+    const callbacks = store.callbacks;
+    if (callbacks === undefined) {
+        return;
+    }
+    return await callbacks.awaitStackRegistrations();
+}
+
+/**
+ * Returns the current callbacks for RPC communications.
+ */
+export function getCallbacks(): ICallbackServer | undefined {
+    const store = getStore();
+    const callbacks = store.callbacks;
+    if (callbacks !== undefined) {
+        return callbacks;
+    }
+
+    const monitorRef = getMonitor();
+    if (monitorRef === undefined) {
+        return undefined;
+    }
+
+    const callbackServer = new CallbackServer(monitorRef);
+    store.callbacks = callbackServer;
+    return callbackServer;
+}
+
+/**
+ * @internal
+ */
 export interface SyncInvokes {
     requests: number;
     responses: number;
@@ -266,7 +459,9 @@ export interface SyncInvokes {
 
 let syncInvokes: SyncInvokes | undefined;
 
-/** @internal */
+/**
+ * @internal
+ */
 export function tryGetSyncInvokes(): SyncInvokes | undefined {
     const syncDir = options().syncDir;
     if (syncInvokes === undefined && syncDir) {
@@ -279,33 +474,37 @@ export function tryGetSyncInvokes(): SyncInvokes | undefined {
 }
 
 /**
- * engine is a live connection to the engine, used for logging, etc. (lazily initialized).
- */
-let engine: any | undefined;
-
-/**
- * hasEngine returns true if we are currently connected to an engine.
+ * Returns true if we are currently connected to an engine.
  */
 export function hasEngine(): boolean {
     return !!engine && !!options().engineAddr;
 }
 
 /**
- * getEngine returns the current engine, if any, for RPC communications back to the resource engine.
+ * Returns the current engine, if any, for RPC communications back to the
+ * resource engine.
  */
-export function getEngine(): Object | undefined {
-    if (engine === undefined) {
-        const addr = options().engineAddr;
-        if (addr) {
-            // Lazily initialize the RPC connection to the engine.
-            engine = new engrpc.EngineClient(
-                addr,
-                grpc.credentials.createInsecure(),
-                grpcChannelOptions,
-            );
+export function getEngine(): engrpc.IEngineClient | undefined {
+    const { settings } = getStore();
+    if (getLocalStore() === undefined) {
+        if (engine === undefined) {
+            const addr = options().engineAddr;
+            if (addr) {
+                // Lazily initialize the RPC connection to the engine.
+                engine = new engrpc.EngineClient(addr, grpc.credentials.createInsecure(), grpcChannelOptions);
+            }
         }
+        return engine;
+    } else {
+        if (settings.engine === undefined) {
+            const addr = options().engineAddr;
+            if (addr) {
+                // Lazily initialize the RPC connection to the engine.
+                settings.engine = new engrpc.EngineClient(addr, grpc.credentials.createInsecure(), grpcChannelOptions);
+            }
+        }
+        return settings.engine;
     }
-    return engine;
 }
 
 export function terminateRpcs() {
@@ -313,72 +512,51 @@ export function terminateRpcs() {
 }
 
 /**
- * serialize returns true if resource operations should be serialized.
+ * Returns true if resource operations should be serialized.
  */
 export function serialize(): boolean {
     return options().parallel === 1;
 }
 
 /**
- * options returns the options from the environment, which is the source of truth. Options are global per process.
- * For CLI driven programs, pulumi-language-nodejs sets environment variables prior to the user program loading,
- * meaning that options could be loaded up front and cached.
- * Automation API and multi-language components introduced more complex lifecycles for runtime options().
- * These language hosts manage the lifecycle of options manually throughout the lifetime of the nodejs process.
- * In addition, node module resolution can lead to duplicate copies of @pulumi/pulumi and thus duplicate options
- *  objects that may not be synced if options are cached upfront. Mutating options must write to the environment
+ * Returns the options from the environment, which is the source of truth.
+ * Options are global per process.
+ *
+ * For CLI driven programs, `pulumi-language-nodejs` sets environment variables
+ * prior to the user program loading, meaning that options could be loaded up
+ * front and cached. Automation API and multi-language components introduced
+ * more complex lifecycles for runtime `options()`. These language hosts manage
+ * the lifecycle of options manually throughout the lifetime of the NodeJS
+ * process. In addition, NodeJS module resolution can lead to duplicate copies
+ * of `@pulumi/pulumi` and thus duplicate options objects that may not be synced
+ * if options are cached upfront. Mutating options must write to the environment
  * and reading options must always read directly from the environment.
-
  */
 function options(): Options {
-    // pre-emptive fail fast check for node inline programs
-    runSxSCheck();
-    // The only option that needs parsing is the parallelism flag.  Ignore any failures.
-    let parallel: number | undefined;
-    const parallelOpt = process.env[nodeEnvKeys.parallel];
-    if (parallelOpt) {
-        try {
-            parallel = parseInt(parallelOpt, 10);
-        }
-        catch (err) {
-            // ignore.
-        }
-    }
+    const { settings } = getStore();
 
-    // Now just hydrate the rest from environment variables.  These might be missing, in which case
-    // we will fail later on when we actually need to create an RPC connection back to the engine.
-    return {
-        // node runtime
-        project: process.env[nodeEnvKeys.project],
-        stack: process.env[nodeEnvKeys.stack],
-        dryRun: (process.env[nodeEnvKeys.dryRun] === "true"),
-        queryMode: (process.env[nodeEnvKeys.queryMode] === "true"),
-        parallel: parallel,
-        monitorAddr: process.env[nodeEnvKeys.monitorAddr],
-        engineAddr: process.env[nodeEnvKeys.engineAddr],
-        syncDir: process.env[nodeEnvKeys.syncDir],
-        cacheDynamicProviders: process.env[nodeEnvKeys.cacheDynamicProviders] !== "false", // true by default
-        // pulumi specific
-        testModeEnabled: (process.env[pulumiEnvKeys.testMode] === "true"),
-        legacyApply: (process.env[pulumiEnvKeys.legacyApply] === "true"),
-    };
+    return settings.options;
 }
 
 /**
- * disconnect permanently disconnects from the server, closing the connections.  It waits for the existing RPC
- * queue to drain.  If any RPCs come in afterwards, however, they will crash the process.
+ * Permanently disconnects from the server, closing the connections. It waits
+ * for the existing RPC queue to drain.  If any RPCs come in afterwards,
+ * however, they will crash the process.
  */
 export function disconnect(): Promise<void> {
     return waitForRPCs(/*disconnectFromServers*/ true);
 }
 
-/** @internal */
+/**
+ * @internal
+ */
 export function waitForRPCs(disconnectFromServers = false): Promise<void> {
+    const localStore = getStore();
     let done: Promise<any> | undefined;
     const closeCallback: () => Promise<void> = () => {
-        if (done !== rpcDone) {
+        if (done !== localStore.settings.rpcDone) {
             // If the done promise has changed, some activity occurred in between callbacks.  Wait again.
-            done = rpcDone;
+            done = localStore.settings.rpcDone;
             return debuggablePromise(done.then(closeCallback), "disconnect");
         }
         if (disconnectFromServers) {
@@ -390,203 +568,104 @@ export function waitForRPCs(disconnectFromServers = false): Promise<void> {
 }
 
 /**
- * disconnectSync permanently disconnects from the server, closing the connections. Unlike `disconnect`. it does not
- * wait for the existing RPC queue to drain. Any RPCs that come in after this call will crash the process.
+ * Returns the configured number of process listeners available.
+ */
+export function getMaximumListeners(): number {
+    const { settings } = getStore();
+    return settings.options.maximumProcessListeners;
+}
+
+/**
+ * Permanently disconnects from the server, closing the connections. Unlike
+ * `disconnect`. it does not wait for the existing RPC queue to drain. Any RPCs
+ * that come in after this call will crash the process.
  */
 export function disconnectSync(): void {
     // Otherwise, actually perform the close activities (ignoring errors and crashes).
+    const store = getStore();
+    if (store.callbacks) {
+        store.callbacks.shutdown();
+        store.callbacks = undefined;
+    }
+
     if (monitor) {
         try {
             monitor.close();
-        }
-        catch (err) {
+        } catch (err) {
             // ignore.
         }
-        monitor = null;
+        monitor = undefined;
     }
     if (engine) {
         try {
             engine.close();
-        }
-        catch (err) {
+        } catch (err) {
             // ignore.
         }
-        engine = null;
+        engine = undefined;
     }
 }
 
 /**
- * rpcDone resolves when the last known client-side RPC call finishes.
- */
-let rpcDone: Promise<any> = Promise.resolve();
-
-/**
- * rpcKeepAlive registers a pending call to ensure that we don't prematurely disconnect from the server.  It returns
- * a function that, when invoked, signals that the RPC has completed.
+ * Registers a pending call to ensure that we don't prematurely disconnect from
+ * the server.  It returns a function that, when invoked, signals that the RPC
+ * has completed.
  */
 export function rpcKeepAlive(): () => void {
+    const localStore = getStore();
     let done: (() => void) | undefined = undefined;
-    const donePromise = debuggablePromise(new Promise<void>(resolve => done = resolve), "rpcKeepAlive");
-    rpcDone = rpcDone.then(() => donePromise);
+    const donePromise = debuggablePromise(
+        new Promise<void>((resolve) => {
+            done = resolve;
+            return done;
+        }),
+        "rpcKeepAlive",
+    );
+    localStore.settings.rpcDone = localStore.settings.rpcDone.then(() => donePromise);
     return done!;
 }
 
-let rootResource: Promise<URN> | undefined;
-
 /**
- * getRootResource returns a root resource URN that will automatically become the default parent of all resources.  This
- * can be used to ensure that all resources without explicit parents are parented to a common parent resource.
+ * Returns if the engine supports package references and parameterized providers.
  */
-export function getRootResource(): Promise<URN | undefined> {
-    const engineRef: any = getEngine();
-    if (!engineRef) {
-        return Promise.resolve(undefined);
-    }
-
-    const req = new engproto.GetRootResourceRequest();
-    return new Promise<URN | undefined>((resolve, reject) => {
-        engineRef.getRootResource(req, (err: grpc.ServiceError, resp: any) => {
-            // Back-compat case - if the engine we're speaking to isn't aware that it can save and load root resources,
-            // fall back to the old behavior.
-            if (err && err.code === grpc.status.UNIMPLEMENTED) {
-                if (rootResource) {
-                    rootResource.then(resolve);
-                    return;
-                }
-
-                resolve(undefined);
-            }
-
-            if (err) {
-                return reject(err);
-            }
-
-            const urn = resp.getUrn();
-            if (urn) {
-                return resolve(urn);
-            }
-
-            return resolve(undefined);
-        });
-    });
+export function supportsParameterization(): boolean {
+    return getStore().supportsParameterization;
 }
 
 /**
- * setRootResource registers a resource that will become the default parent for all resources without explicit parents.
+ * Registers a resource that will become the default parent for all resources
+ * without explicit parents.
  */
 export async function setRootResource(res: ComponentResource): Promise<void> {
-    const engineRef: any = getEngine();
+    // This is the first async point of program startup where we can query the resource monitor for its capabilities.
+    await awaitFeatureSupport();
+
+    const engineRef = getEngine();
     if (!engineRef) {
         return Promise.resolve();
     }
 
+    // Back-compat case - Try to set the root URN for SxS old SDKs that expect the engine to roundtrip the
+    // stack URN.
     const req = new engproto.SetRootResourceRequest();
     const urn = await res.urn.promise();
     req.setUrn(urn);
     return new Promise<void>((resolve, reject) => {
-        engineRef.setRootResource(req, (err: grpc.ServiceError, resp: any) => {
-            // Back-compat case - if the engine we're speaking to isn't aware that it can save and load root resources,
-            // fall back to the old behavior.
-            if (err && err.code === grpc.status.UNIMPLEMENTED) {
-                rootResource = res.urn.promise();
-                return resolve();
-            }
-
-            if (err) {
-                return reject(err);
-            }
-
-            return resolve();
-        });
-    });
-}
-
-/**
- * monitorSupportsFeature returns a promise that when resolved tells you if the resource monitor we are connected
- * to is able to support a particular feature.
- */
-export async function monitorSupportsFeature(feature: string): Promise<boolean> {
-    const monitorRef: any = getMonitor();
-    if (!monitorRef) {
-        // If there's no monitor and test mode is disabled, just return false. Otherwise, return whatever is present in
-        // the featureSupport map.
-        return isTestModeEnabled() && featureSupport[feature];
-    }
-
-    if (featureSupport[feature] === undefined) {
-        const req = new resproto.SupportsFeatureRequest();
-        req.setId(feature);
-
-        const result = await new Promise<boolean>((resolve, reject) => {
-            monitorRef.supportsFeature(req, (err: grpc.ServiceError, resp: any) => {
-                // Back-compat case - if the monitor doesn't let us ask if it supports a feature, it doesn't support
-                // secrets.
+        engineRef.setRootResource(
+            req,
+            (err: grpc.ServiceError | null, resp: engproto.SetRootResourceResponse | undefined) => {
+                // Back-compat case - if the engine we're speaking to isn't aware that it can save and load root
+                // resources, just ignore there's nothing we can do.
                 if (err && err.code === grpc.status.UNIMPLEMENTED) {
-                    return resolve(false);
+                    return resolve();
                 }
 
                 if (err) {
                     return reject(err);
                 }
 
-                return resolve(resp.getHassupport());
-            });
-        });
-
-        featureSupport[feature] = result;
-    }
-
-    return featureSupport[feature];
-}
-
-/**
- * monitorSupportsSecrets returns a promise that when resolved tells you if the resource monitor we are connected
- * to is able to support secrets across its RPC interface. When it does, we marshal outputs marked with the secret
- * bit in a special way.
- */
-export function monitorSupportsSecrets(): Promise<boolean> {
-    return monitorSupportsFeature("secrets");
-}
-
-/**
- * monitorSupportsResourceReferences returns a promise that when resolved tells you if the resource monitor we are
- * connected to is able to support resource references across its RPC interface. When it does, we marshal resources
- * in a special way.
- */
-export async function monitorSupportsResourceReferences(): Promise<boolean> {
-    return monitorSupportsFeature("resourceReferences");
-}
-
-// sxsRandomIdentifier is a module level global that is transfered to process.env.
-// the goal is to detect side by side (sxs) pulumi/pulumi situations for inline programs
-// and fail fast. See https://github.com/pulumi/pulumi/issues/7333 for details.
-const sxsRandomIdentifier = Math.random().toString();
-
-// indicates that the current runtime context is via an inline program via automation api.
-let isInline = false;
-
-/** @internal only used by the internal inline language host implementation */
-export function setInline() {
-    isInline = true;
-}
-
-const pulumiSxSEnv = "PULUMI_NODEJS_SXS_FLAG";
-
-/**
- * runSxSCheck checks an identifier stored in the environment to detect multiple versions of pulumi.
- * if we're running in inline mode, it will throw an error to fail fast due to global state collisions that can occur.
- */
-function runSxSCheck() {
-    const envSxS = process.env[pulumiSxSEnv];
-    process.env[pulumiSxSEnv] = sxsRandomIdentifier;
-
-    if (!isInline) {
-        return;
-    }
-
-    // if we see a different identifier, another version of pulumi has been loaded and we should fail.
-    if (!!envSxS && envSxS !== sxsRandomIdentifier) {
-        throw new Error("Detected multiple versions of '@pulumi/pulumi' in use in an inline automation api program.\n" +
-            "Use the yarn 'resolutions' field to pin to a single version: https://github.com/pulumi/pulumi/issues/5449.");
-    }
+                return resolve();
+            },
+        );
+    });
 }

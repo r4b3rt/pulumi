@@ -15,7 +15,7 @@
 // Pulling out some of the repeated strings tokens into constants would harm readability, so we just ignore the
 // goconst linter's warning.
 //
-// nolint: lll, goconst
+//nolint:lll, goconst
 package nodejs
 
 import (
@@ -34,7 +34,7 @@ var _ codegen.DocLanguageHelper = DocLanguageHelper{}
 // GetDocLinkForPulumiType returns the NodeJS API doc link for a Pulumi type.
 func (d DocLanguageHelper) GetDocLinkForPulumiType(pkg *schema.Package, typeName string) string {
 	typeName = strings.ReplaceAll(typeName, "?", "")
-	return fmt.Sprintf("/docs/reference/pkg/nodejs/pulumi/pulumi/#%s", typeName)
+	return "/docs/reference/pkg/nodejs/pulumi/pulumi/#" + typeName
 }
 
 // GetDocLinkForResourceType returns the NodeJS API doc for a type belonging to a resource provider.
@@ -77,7 +77,7 @@ func (d DocLanguageHelper) GetLanguageTypeString(pkg *schema.Package, moduleName
 	}
 
 	modCtx := &modContext{
-		pkg: pkg,
+		pkg: pkg.Reference(),
 		mod: moduleName,
 	}
 	typeName := modCtx.typeString(t, input, nil)
@@ -104,6 +104,38 @@ func (d DocLanguageHelper) GetResourceFunctionResultName(modName string, f *sche
 	return title(funcName) + "Result"
 }
 
+func (d DocLanguageHelper) GetMethodName(m *schema.Method) string {
+	return camel(m.Name)
+}
+
+func (d DocLanguageHelper) GetMethodResultName(pkg *schema.Package, modName string, r *schema.Resource,
+	m *schema.Method,
+) string {
+	var objectReturnType *schema.ObjectType
+	if m.Function.ReturnType != nil {
+		if objectType, ok := m.Function.ReturnType.(*schema.ObjectType); ok && objectType != nil {
+			objectReturnType = objectType
+		} else {
+			modCtx := &modContext{
+				pkg: pkg.Reference(),
+				mod: modName,
+			}
+			return modCtx.typeString(m.Function.ReturnType, false, nil)
+		}
+	}
+
+	if info, ok := pkg.Language["nodejs"].(NodePackageInfo); ok {
+		if info.LiftSingleValueMethodReturns && objectReturnType != nil && len(objectReturnType.Properties) == 1 {
+			modCtx := &modContext{
+				pkg: pkg.Reference(),
+				mod: modName,
+			}
+			return modCtx.typeString(objectReturnType.Properties[0].Type, false, nil)
+		}
+	}
+	return fmt.Sprintf("%s.%sResult", resourceName(r), title(d.GetMethodName(m)))
+}
+
 // GetPropertyName returns the property name specific to NodeJS.
 func (d DocLanguageHelper) GetPropertyName(p *schema.Property) (string, error) {
 	return p.Name, nil
@@ -111,11 +143,7 @@ func (d DocLanguageHelper) GetPropertyName(p *schema.Property) (string, error) {
 
 // GetEnumName returns the enum name specific to NodeJS.
 func (d DocLanguageHelper) GetEnumName(e *schema.Enum, typeName string) (string, error) {
-	name := fmt.Sprintf("%v", e.Value)
-	if e.Name != "" {
-		name = e.Name
-	}
-	return makeSafeEnumName(name, typeName)
+	return enumMemberName(typeName, e)
 }
 
 // GetModuleDocLink returns the display name and the link for a module.
@@ -123,7 +151,7 @@ func (d DocLanguageHelper) GetModuleDocLink(pkg *schema.Package, modName string)
 	var displayName string
 	var link string
 	if modName == "" {
-		displayName = fmt.Sprintf("@pulumi/%s", pkg.Name)
+		displayName = "@pulumi/" + pkg.Name
 	} else {
 		displayName = fmt.Sprintf("@pulumi/%s/%s", pkg.Name, strings.ToLower(modName))
 	}

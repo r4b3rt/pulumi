@@ -12,25 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build nodejs all
+//go:build nodejs || all
 
 package workspace
 
 import (
-	"os"
 	"testing"
 )
 
 var tarball = map[string][]byte{
 	"PulumiPlugin.yaml": []byte("runtime: nodejs\n"),
-	"package.json":      []byte(`{"name":"test","dependencies":{"@pulumi/pulumi":"^2.0.0"}}`),
+	"package.json":      []byte(`{"name":"test","dependencies":{"@pulumi/pulumi":"latest"}}`),
 }
 
 func TestNodeNPMInstall(t *testing.T) {
+	t.Parallel()
 	testPluginInstall(t, "node_modules", tarball)
 }
 
+//nolint:paralleltest // mutates environment variables
 func TestNodeYarnInstall(t *testing.T) {
-	os.Setenv("PULUMI_PREFER_YARN", "true")
+	t.Setenv("PULUMI_PREFER_YARN", "true")
 	testPluginInstall(t, "node_modules", tarball)
 }

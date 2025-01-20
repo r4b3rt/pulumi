@@ -15,7 +15,7 @@
 // Pulling out some of the repeated strings tokens into constants would harm readability, so we just ignore the
 // goconst linter's warning.
 //
-// nolint: lll, goconst
+//nolint:lll, goconst
 package gen
 
 import (
@@ -26,6 +26,7 @@ import (
 	"github.com/golang/glog"
 	"github.com/pulumi/pulumi/pkg/v3/codegen"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 )
 
 const pulumiSDKVersion = "v3"
@@ -42,7 +43,7 @@ func (d DocLanguageHelper) GetDocLinkForPulumiType(pkg *schema.Package, typeName
 	version := pulumiSDKVersion
 	if info, ok := pkg.Language["go"].(GoPackageInfo); ok {
 		if info.PulumiSDKVersion == 1 {
-			return fmt.Sprintf("https://pkg.go.dev/github.com/pulumi/pulumi/sdk/go/pulumi?tab=doc#%s", typeName)
+			return "https://pkg.go.dev/github.com/pulumi/pulumi/sdk/go/pulumi?tab=doc#" + typeName
 		}
 		if info.PulumiSDKVersion != 0 {
 			version = fmt.Sprintf("v%d", info.PulumiSDKVersion)
@@ -53,7 +54,7 @@ func (d DocLanguageHelper) GetDocLinkForPulumiType(pkg *schema.Package, typeName
 
 // GetDocLinkForResourceType returns the godoc URL for a type belonging to a resource provider.
 func (d DocLanguageHelper) GetDocLinkForResourceType(pkg *schema.Package, moduleName string, typeName string) string {
-	path := fmt.Sprintf("%s/%s", goPackage(pkg.Name), moduleName)
+	path := fmt.Sprintf("%s/%s", packageName(pkg), moduleName)
 	typeNameParts := strings.Split(typeName, ".")
 	typeName = typeNameParts[len(typeNameParts)-1]
 	typeName = strings.TrimPrefix(typeName, "*")
@@ -98,7 +99,9 @@ func (d DocLanguageHelper) GetLanguageTypeString(pkg *schema.Package, moduleName
 
 // GeneratePackagesMap generates a map of Go packages for resources, functions and types.
 func (d *DocLanguageHelper) GeneratePackagesMap(pkg *schema.Package, tool string, goInfo GoPackageInfo) {
-	d.packages = generatePackageContextMap(tool, pkg, goInfo)
+	var err error
+	d.packages, err = generatePackageContextMap(tool, pkg.Reference(), goInfo, nil)
+	contract.AssertNoErrorf(err, "Could not generate package context map for %q", pkg.Name)
 }
 
 // GetPropertyName returns the property name specific to Go.
@@ -135,14 +138,43 @@ func (d DocLanguageHelper) GetResourceFunctionResultName(modName string, f *sche
 	return funcName + "Result"
 }
 
+func (d DocLanguageHelper) GetMethodName(m *schema.Method) string {
+	return Title(m.Name)
+}
+
+func (d DocLanguageHelper) GetMethodResultName(pkg *schema.Package, modName string, r *schema.Resource,
+	m *schema.Method,
+) string {
+	if info, ok := pkg.Language["go"].(GoPackageInfo); ok {
+		var objectReturnType *schema.ObjectType
+		if m.Function.ReturnType != nil {
+			if objectType, ok := m.Function.ReturnType.(*schema.ObjectType); ok && objectType != nil {
+				objectReturnType = objectType
+			}
+		}
+
+		if info.LiftSingleValueMethodReturns && objectReturnType != nil && len(objectReturnType.Properties) == 1 {
+			t := objectReturnType.Properties[0].Type
+			modPkg, ok := d.packages[modName]
+			if !ok {
+				glog.Errorf("cannot calculate type string for type %q. could not find a package for module %q",
+					t.String(), modName)
+				os.Exit(1)
+			}
+			return modPkg.outputType(t)
+		}
+	}
+	return fmt.Sprintf("%s%sResultOutput", rawResourceName(r), d.GetMethodName(m))
+}
+
 // GetModuleDocLink returns the display name and the link for a module.
 func (d DocLanguageHelper) GetModuleDocLink(pkg *schema.Package, modName string) (string, string) {
 	var displayName string
 	var link string
 	if modName == "" {
-		displayName = goPackage(pkg.Name)
+		displayName = packageName(pkg)
 	} else {
-		displayName = fmt.Sprintf("%s/%s", goPackage(pkg.Name), modName)
+		displayName = fmt.Sprintf("%s/%s", packageName(pkg), modName)
 	}
 	link = d.GetDocLinkForResourceType(pkg, modName, "")
 	return displayName, link

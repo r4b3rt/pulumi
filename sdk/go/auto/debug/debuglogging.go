@@ -1,3 +1,17 @@
+// Copyright 2020-2024, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package debug
 
 import "fmt"
@@ -14,6 +28,10 @@ type LoggingOptions struct {
 	LogToStdErr bool
 	// FlowToPlugins reflects the logging settings to plugins as well.
 	FlowToPlugins bool
+	// Emit tracing to the specified endpoint. Use the file: scheme to write tracing data to a local file
+	Tracing string
+	// Print detailed debugging output during resource operations
+	Debug bool
 }
 
 func AddArgs(debugLogOpts *LoggingOptions, sharedArgs []string) []string {
@@ -28,6 +46,12 @@ func AddArgs(debugLogOpts *LoggingOptions, sharedArgs []string) []string {
 	}
 	if debugLogOpts.FlowToPlugins {
 		sharedArgs = append(sharedArgs, "--logflow")
+	}
+	if debugLogOpts.Tracing != "" {
+		sharedArgs = append(sharedArgs, fmt.Sprintf("--tracing=%v", debugLogOpts.Tracing))
+	}
+	if debugLogOpts.Debug {
+		sharedArgs = append(sharedArgs, "--debug")
 	}
 	return sharedArgs
 }

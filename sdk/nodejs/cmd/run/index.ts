@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Enable source map support so we get good stack traces.
+import "source-map-support/register";
+
 import * as log from "../../log";
 
 // The very first thing we do is set up unhandled exception and rejection hooks to ensure that these
@@ -35,7 +38,7 @@ let programRunning = false;
 const uncaughtHandler = (err: Error) => {
     uncaughtErrors.add(err);
     if (!programRunning && !loggedErrors.has(err)) {
-        log.error(err.stack || err.message || ("" + err));
+        log.error(err.stack || err.message || "" + err);
         // dedupe errors that we're reporting when the program is not running
         loggedErrors.add(err);
     }
@@ -47,7 +50,7 @@ const uncaughtHandler = (err: Error) => {
 //
 // 32 was picked so as to be very unlikely to collide with any of the error codes documented by
 // nodejs here:
-// https://github.com/nodejs/node-v0.x-archive/blob/master/doc/api/process.markdown#exit-codes
+// https://nodejs.org/api/process.html#process_exit_codes
 /** @internal */
 export const nodeJSProcessExitedAfterLoggingUserActionableMessage = 32;
 
@@ -83,12 +86,13 @@ process.on("exit", (code: number) => {
 import * as v8Hooks from "../../runtime/closure/v8Hooks";
 
 // This is the entrypoint for running a Node.js program with minimal scaffolding.
-import * as minimist from "minimist";
+import minimist from "minimist";
 
 function usage(): void {
     console.error(`usage: RUN <flags> [program] <[arg]...>`);
     console.error(``);
     console.error(`    where [flags] may include`);
+    console.error(`        --organization=o    set the organization name to o`);
     console.error(`        --project=p         set the project name to p`);
     console.error(`        --stack=s           set the stack name to s`);
     console.error(`        --config.k=v...     set runtime config key k to value v`);
@@ -113,8 +117,10 @@ function printErrorUsageAndExit(message: string): never {
 function main(args: string[]): void {
     // See usage above for the intended usage of this program, including flags and required args.
     const argv: minimist.ParsedArgs = minimist(args, {
-        boolean: [ "dry-run", "query-mode" ],
-        string: [ "project", "stack", "parallel", "pwd", "monitor", "engine", "tracing" ],
+        // eslint-disable-next-line id-blacklist
+        boolean: ["dry-run", "query-mode"],
+        // eslint-disable-next-line id-blacklist
+        string: ["organization", "project", "stack", "parallel", "pwd", "monitor", "engine", "tracing"],
         unknown: (arg: string) => {
             return true;
         },
@@ -125,7 +131,8 @@ function main(args: string[]): void {
     if (argv["parallel"]) {
         if (isNaN(parseInt(argv["parallel"], 10))) {
             return printErrorUsageAndExit(
-                `error: --parallel flag must specify a number: ${argv["parallel"]} is not a number`);
+                `error: --parallel flag must specify a number: ${argv["parallel"]} is not a number`,
+            );
         }
     }
 
@@ -144,6 +151,7 @@ function main(args: string[]): void {
     // to squirel these settings in the environment such that other copies which may be loaded later can recover them.
     //
     // Config is already an environment variaible set by the language plugin.
+    addToEnvIfDefined("PULUMI_NODEJS_ORGANIZATION", argv["organization"]);
     addToEnvIfDefined("PULUMI_NODEJS_PROJECT", argv["project"]);
     addToEnvIfDefined("PULUMI_NODEJS_STACK", argv["stack"]);
     addToEnvIfDefined("PULUMI_NODEJS_DRY_RUN", argv["dry-run"]);
@@ -157,17 +165,22 @@ function main(args: string[]): void {
     v8Hooks.isInitializedAsync().then(() => {
         const promise: Promise<void> = require("./run").run(
             argv,
-            /*programStarted:   */ () => programRunning = true,
+            /*programStarted:   */ () => {
+                programRunning = true;
+            },
             /*reportLoggedError:*/ (err: Error) => loggedErrors.add(err),
-            /*isErrorReported:  */ (err: Error) => loggedErrors.has(err));
+            /*isErrorReported:  */ (err: Error) => loggedErrors.has(err),
+        );
 
         // when the user's program completes successfully, set programRunning back to false.  That way, if the Pulumi
         // scaffolding code ends up throwing an exception during teardown, it will get printed directly to the console.
         //
         // Note: we only do this in the 'resolved' arg of '.then' (not the 'rejected' arg).  If the users code throws
-        // an exception, this promise will get rejected, and we don't want touch or otherwise intercept the exception
+        // an exception, this promise will get rejected, and we don't want to touch or otherwise intercept the exception
         // or change the programRunning state here at all.
-        promise.then(() => { programRunning = false; });
+        promise.then(() => {
+            programRunning = false;
+        });
     });
 }
 

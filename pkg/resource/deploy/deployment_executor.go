@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2024, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,14 +16,16 @@ package deploy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
-	"github.com/pkg/errors"
+	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/providers"
 	"github.com/pulumi/pulumi/pkg/v3/resource/graph"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/urn"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/result"
@@ -37,30 +39,15 @@ type deploymentExecutor struct {
 
 	stepGen  *stepGenerator // step generator owned by this deployment
 	stepExec *stepExecutor  // step executor owned by this deployment
-}
 
-// A set is returned of all the target URNs to facilitate later callers.  The set can be 'nil'
-// indicating no targets, or will be non-nil and non-empty if there are targets.  Only URNs in the
-// original array are in the set.  i.e. it's only checked for containment.  The value of the map is
-// unused.
-func createTargetMap(targets []resource.URN) map[resource.URN]bool {
-	if len(targets) == 0 {
-		return nil
-	}
-
-	targetMap := make(map[resource.URN]bool)
-	for _, target := range targets {
-		targetMap[target] = true
-	}
-
-	return targetMap
+	skipped mapset.Set[urn.URN] // The set of resources that have failed
 }
 
 // checkTargets validates that all the targets passed in refer to existing resources.  Diagnostics
 // are generated for any target that cannot be found.  The target must either have existed in the stack
 // prior to running the operation, or it must be the urn for a resource that was created.
-func (ex *deploymentExecutor) checkTargets(targets []resource.URN, op StepOp) result.Result {
-	if len(targets) == 0 {
+func (ex *deploymentExecutor) checkTargets(targets UrnTargets) error {
+	if !targets.IsConstrained() {
 		return nil
 	}
 
@@ -71,17 +58,13 @@ func (ex *deploymentExecutor) checkTargets(targets []resource.URN, op StepOp) re
 	}
 
 	hasUnknownTarget := false
-	for _, target := range targets {
-		hasOld := false
-		if _, has := olds[target]; has {
-			hasOld = true
-		}
-
+	for _, target := range targets.Literals() {
+		hasOld := olds != nil && olds[target] != nil
 		hasNew := news != nil && news[target]
 		if !hasOld && !hasNew {
 			hasUnknownTarget = true
 
-			logging.V(7).Infof("Resource to %v (%v) could not be found in the stack.", op, target)
+			logging.V(7).Infof("Targeted resource could not be found in the stack [urn=%v]", target)
 			if strings.Contains(string(target), "$") {
 				ex.deployment.Diag().Errorf(diag.GetTargetCouldNotBeFoundError(), target)
 			} else {
@@ -91,16 +74,42 @@ func (ex *deploymentExecutor) checkTargets(targets []resource.URN, op StepOp) re
 	}
 
 	if hasUnknownTarget {
-		return result.Bail()
+		return result.BailErrorf("one or more targets could not be found in the stack")
 	}
 
 	return nil
 }
 
+func (ex *deploymentExecutor) printPendingOperationsWarning() {
+	pendingOperations := ""
+	for _, op := range ex.deployment.prev.PendingOperations {
+		pendingOperations = pendingOperations + fmt.Sprintf("  * %s, interrupted while %s\n", op.Resource.URN, op.Type)
+	}
+
+	resolutionMessage := "" +
+		"These resources are in an unknown state because the Pulumi CLI was interrupted while " +
+		"waiting for changes to these resources to complete. You should confirm whether or not the " +
+		"operations listed completed successfully by checking the state of the appropriate provider. " +
+		"For example, if you are using AWS, you can confirm using the AWS Console.\n" +
+		"\n" +
+		"Once you have confirmed the status of the interrupted operations, you can repair your stack " +
+		"using `pulumi refresh` which will refresh the state from the provider you are using and " +
+		"clear the pending operations if there are any.\n" +
+		"\n" +
+		"Note that `pulumi refresh` will need to be run interactively to clear pending CREATE operations."
+
+	warning := "Attempting to deploy or update resources " +
+		fmt.Sprintf("with %d pending operations from previous deployment.\n", len(ex.deployment.prev.PendingOperations)) +
+		pendingOperations +
+		resolutionMessage
+
+	ex.deployment.Diag().Warningf(diag.RawMessage("" /*urn*/, warning))
+}
+
 // reportExecResult issues an appropriate diagnostic depending on went wrong.
-func (ex *deploymentExecutor) reportExecResult(message string, preview bool) {
+func (ex *deploymentExecutor) reportExecResult(message string) {
 	kind := "update"
-	if preview {
+	if ex.deployment.opts.DryRun {
 		kind = "preview"
 	}
 
@@ -114,10 +123,11 @@ func (ex *deploymentExecutor) reportError(urn resource.URN, err error) {
 
 // Execute executes a deployment to completion, using the given cancellation context and running a preview
 // or update.
-func (ex *deploymentExecutor) Execute(callerCtx context.Context, opts Options, preview bool) result.Result {
+func (ex *deploymentExecutor) Execute(callerCtx context.Context) (*Plan, error) {
 	// Set up a goroutine that will signal cancellation to the deployment's plugins if the caller context is cancelled.
 	// We do not hang this off of the context we create below because we do not want the failure of a single step to
 	// cause other steps to fail.
+	ex.skipped = mapset.NewSet[urn.URN]()
 	done := make(chan bool)
 	defer close(done)
 	go func() {
@@ -135,70 +145,56 @@ func (ex *deploymentExecutor) Execute(callerCtx context.Context, opts Options, p
 
 	// If this deployment is an import, run the imports and exit.
 	if ex.deployment.isImport {
-		return ex.importResources(callerCtx, opts, preview)
+		return ex.importResources(callerCtx)
 	}
 
 	// Before doing anything else, optionally refresh each resource in the base checkpoint.
-	if opts.Refresh {
-		if res := ex.refresh(callerCtx, opts, preview); res != nil {
-			return res
+	if ex.deployment.opts.Refresh {
+		if err := ex.refresh(callerCtx); err != nil {
+			return nil, err
 		}
-		if opts.RefreshOnly {
-			return nil
+		if ex.deployment.opts.RefreshOnly {
+			return nil, nil
 		}
+	} else if ex.deployment.prev != nil && len(ex.deployment.prev.PendingOperations) > 0 && !ex.deployment.opts.DryRun {
+		// Print a warning for users that there are pending operations.
+		// Explain that these operations can be cleared using pulumi refresh (except for CREATE operations)
+		// since these require user intevention:
+		ex.printPendingOperationsWarning()
 	}
 
-	// The set of -t targets provided on hte command line.  'nil' means 'update everything'.
-	// Non-nill means 'update only in this set'.  We don't error if the user specifies an target
-	// during `update` that we don't know about because it might be the urn for a resource they
-	// want to create.
-	updateTargetsOpt := createTargetMap(opts.UpdateTargets)
-	replaceTargetsOpt := createTargetMap(opts.ReplaceTargets)
-	destroyTargetsOpt := createTargetMap(opts.DestroyTargets)
-	if res := ex.checkTargets(opts.ReplaceTargets, OpReplace); res != nil {
-		return res
-	}
-	if res := ex.checkTargets(opts.DestroyTargets, OpDelete); res != nil {
-		return res
-	}
-
-	if (updateTargetsOpt != nil || replaceTargetsOpt != nil) && destroyTargetsOpt != nil {
-		contract.Failf("Should not be possible to have both .DestroyTargets and .UpdateTargets or .ReplaceTargets")
+	if err := ex.checkTargets(ex.deployment.opts.ReplaceTargets); err != nil {
+		return nil, err
 	}
 
 	// Begin iterating the source.
-	src, res := ex.deployment.source.Iterate(callerCtx, opts, ex.deployment)
-	if res != nil {
-		return res
+	src, err := ex.deployment.source.Iterate(callerCtx, ex.deployment)
+	if err != nil {
+		return nil, err
 	}
 
 	// Set up a step generator for this deployment.
-	ex.stepGen = newStepGenerator(ex.deployment, opts, updateTargetsOpt, replaceTargetsOpt)
-
-	// Retire any pending deletes that are currently present in this deployment.
-	if res := ex.retirePendingDeletes(callerCtx, opts, preview); res != nil {
-		return res
-	}
+	ex.stepGen = newStepGenerator(ex.deployment)
 
 	// Derive a cancellable context for this deployment. We will only cancel this context if some piece of the
 	// deployment's execution fails.
 	ctx, cancel := context.WithCancel(callerCtx)
 
 	// Set up a step generator and executor for this deployment.
-	ex.stepExec = newStepExecutor(ctx, cancel, ex.deployment, opts, preview, false)
+	ex.stepExec = newStepExecutor(ctx, cancel, ex.deployment, false)
 
 	// We iterate the source in its own goroutine because iteration is blocking and we want the main loop to be able to
 	// respond to cancellation requests promptly.
 	type nextEvent struct {
-		Event  SourceEvent
-		Result result.Result
+		Event SourceEvent
+		Error error
 	}
 	incomingEvents := make(chan nextEvent)
 	go func() {
 		for {
-			event, sourceErr := src.Next()
+			event, err := src.Next()
 			select {
-			case incomingEvents <- nextEvent{event, sourceErr}:
+			case incomingEvents <- nextEvent{event, err}:
 				if event == nil {
 					return
 				}
@@ -217,35 +213,51 @@ func (ex *deploymentExecutor) Execute(callerCtx context.Context, opts Options, p
 	//     should bail.
 	//  3. The stepExecCancel cancel context gets canceled. This means some error occurred in the step executor
 	//     and we need to bail. This can also happen if the user hits Ctrl-C.
-	canceled, res := func() (bool, result.Result) {
+	canceled, err := func() (bool, error) {
 		logging.V(4).Infof("deploymentExecutor.Execute(...): waiting for incoming events")
 		for {
 			select {
 			case event := <-incomingEvents:
 				logging.V(4).Infof("deploymentExecutor.Execute(...): incoming event (nil? %v, %v)", event.Event == nil,
-					event.Result)
+					event.Error)
 
-				if event.Result != nil {
-					if !event.Result.IsBail() {
-						ex.reportError("", event.Result.Error())
+				if event.Error != nil {
+					if !result.IsBail(event.Error) {
+						ex.reportError("", event.Error)
 					}
 					cancel()
 
 					// We reported any errors above.  So we can just bail now.
-					return false, result.Bail()
+					return false, result.BailError(event.Error)
 				}
 
 				if event.Event == nil {
-					return false, ex.performDeletes(ctx, updateTargetsOpt, destroyTargetsOpt)
+					// Check targets before performDeletes mutates the initial Snapshot.
+					targetErr := ex.checkTargets(ex.deployment.opts.Targets)
+
+					err := ex.performDeletes(ctx, ex.deployment.opts.Targets)
+					if err != nil {
+						if !result.IsBail(err) {
+							logging.V(4).Infof("deploymentExecutor.Execute(...): error performing deletes: %v", err)
+							ex.reportError("", err)
+							return false, result.BailError(err)
+						}
+					}
+
+					if targetErr != nil {
+						// Propagate the target error as it hasn't been reported yet.
+						return false, targetErr
+					}
+					return false, nil
 				}
 
-				if res := ex.handleSingleEvent(event.Event); res != nil {
-					if resErr := res.Error(); resErr != nil {
-						logging.V(4).Infof("deploymentExecutor.Execute(...): error handling event: %v", resErr)
-						ex.reportError(ex.deployment.generateEventURN(event.Event), resErr)
+				if err := ex.handleSingleEvent(event.Event); err != nil {
+					if !result.IsBail(err) {
+						logging.V(4).Infof("deploymentExecutor.Execute(...): error handling event: %v", err)
+						ex.reportError(ex.deployment.generateEventURN(event.Event), err)
 					}
 					cancel()
-					return false, result.Bail()
+					return false, result.BailError(err)
 				}
 			case <-ctx.Done():
 				logging.V(4).Infof("deploymentExecutor.Execute(...): context finished: %v", ctx.Err())
@@ -258,49 +270,97 @@ func (ex *deploymentExecutor) Execute(callerCtx context.Context, opts Options, p
 	}()
 
 	ex.stepExec.WaitForCompletion()
-	logging.V(4).Infof("deploymentExecutor.Execute(...): step executor has completed")
 
-	// Now that we've performed all steps in the deployment, ensure that the list of targets to update was
-	// valid.  We have to do this *after* performing the steps as the target list may have referred
-	// to a resource that was created in one of hte steps.
-	if res == nil {
-		res = ex.checkTargets(opts.UpdateTargets, OpUpdate)
+	stepExecutorError := ex.stepExec.Errored()
+
+	// Finalize the stack outputs.
+	if e := ex.stepExec.stackOutputsEvent; e != nil {
+		errored := err != nil || stepExecutorError != nil || ex.stepGen.Errored()
+		finalizingStackOutputs := true
+		if err := ex.stepExec.executeRegisterResourceOutputs(e, errored, finalizingStackOutputs); err != nil {
+			return nil, result.BailError(err)
+		}
 	}
 
-	if res != nil && res.IsBail() {
-		return res
+	logging.V(4).Infof("deploymentExecutor.Execute(...): step executor has completed")
+
+	// Check that we did operations for everything expected in the plan. We mutate ResourcePlan.Ops as we run
+	// so by the time we get here everything in the map should have an empty ops list (except for unneeded
+	// deletes). We skip this check if we already have an error, chances are if the deployment failed lots of
+	// operations wouldn't have got a chance to run so we'll spam errors about all of those failed operations
+	// making it less clear to the user what the root cause error was.
+	if err == nil && ex.deployment.plan != nil {
+		for urn, resourcePlan := range ex.deployment.plan.ResourcePlans {
+			if len(resourcePlan.Ops) != 0 {
+				if len(resourcePlan.Ops) == 1 && resourcePlan.Ops[0] == OpDelete {
+					// We haven't done a delete for this resource check if it was in the snapshot,
+					// if it's already gone this wasn't done because it wasn't needed
+					found := false
+					for i := range ex.deployment.prev.Resources {
+						if ex.deployment.prev.Resources[i].URN == urn {
+							found = true
+							break
+						}
+					}
+
+					// Didn't find the resource in the old snapshot so this was just an unneeded delete
+					if !found {
+						continue
+					}
+				}
+
+				rErr := fmt.Errorf("expected resource operations for %v but none were seen", urn)
+				logging.V(4).Infof("deploymentExecutor.Execute(...): error handling event: %v", rErr)
+				ex.reportError(urn, rErr)
+				err = errors.Join(err, rErr)
+			}
+		}
+		// If we made any errors above wrap it in a bail
+		if err != nil {
+			err = result.BailError(err)
+		}
+	}
+
+	if err != nil && result.IsBail(err) {
+		return nil, err
 	}
 
 	// If the step generator and step executor were both successful, then we send all the resources
 	// observed to be analyzed. Otherwise, this step is skipped.
-	if res == nil && !ex.stepExec.Errored() {
-		res := ex.stepGen.AnalyzeResources()
-		if res != nil {
-			if resErr := res.Error(); resErr != nil {
-				logging.V(4).Infof("deploymentExecutor.Execute(...): error analyzing resources: %v", resErr)
-				ex.reportError("", resErr)
+	if err == nil && stepExecutorError == nil {
+		err := ex.stepGen.AnalyzeResources()
+		if err != nil {
+			if !result.IsBail(err) {
+				logging.V(4).Infof("deploymentExecutor.Execute(...): error analyzing resources: %v", err)
+				ex.reportError("", err)
 			}
-			return result.Bail()
+			return nil, result.BailErrorf("failed to analyze resources: %v", err)
 		}
 	}
 
 	// Figure out if execution failed and why. Step generation and execution errors trump cancellation.
-	if res != nil || ex.stepExec.Errored() || ex.stepGen.Errored() {
+	if err != nil || stepExecutorError != nil || ex.stepGen.Errored() {
 		// TODO(cyrusn): We seem to be losing any information about the original 'res's errors.  Should
 		// we be doing a merge here?
-		ex.reportExecResult("failed", preview)
-		return result.Bail()
+		ex.reportExecResult("failed")
+		if err != nil {
+			return nil, result.BailError(err)
+		}
+		if stepExecutorError != nil {
+			return nil, result.BailErrorf("step executor errored: %w", stepExecutorError)
+		}
+		return nil, result.BailErrorf("step generator errored")
 	} else if canceled {
-		ex.reportExecResult("canceled", preview)
-		return result.Bail()
+		ex.reportExecResult("canceled")
+		return nil, result.BailErrorf("canceled")
 	}
 
-	return res
+	return ex.deployment.newPlans.plan(), err
 }
 
 func (ex *deploymentExecutor) performDeletes(
-	ctx context.Context, updateTargetsOpt, destroyTargetsOpt map[resource.URN]bool) result.Result {
-
+	ctx context.Context, targetsOpt UrnTargets,
+) error {
 	defer func() {
 		// We're done here - signal completion so that the step executor knows to terminate.
 		ex.stepExec.SignalCompletion()
@@ -313,23 +373,21 @@ func (ex *deploymentExecutor) performDeletes(
 
 	logging.V(7).Infof("performDeletes(...): beginning")
 
+	// GenerateDeletes mutates state we need to lock the step executor while we do this.
+	ex.stepExec.Lock()
+
 	// At this point we have generated the set of resources above that we would normally want to
 	// delete.  However, if the user provided -target's we will only actually delete the specific
 	// resources that are in the set explicitly asked for.
-	var targetsOpt map[resource.URN]bool
-	if updateTargetsOpt != nil {
-		targetsOpt = updateTargetsOpt
-	} else if destroyTargetsOpt != nil {
-		targetsOpt = destroyTargetsOpt
-	}
-
-	deleteSteps, res := ex.stepGen.GenerateDeletes(targetsOpt)
-	if res != nil {
+	deleteSteps, err := ex.stepGen.GenerateDeletes(targetsOpt)
+	// Regardless of if this error'd or not the step executor needs unlocking
+	ex.stepExec.Unlock()
+	if err != nil {
 		logging.V(7).Infof("performDeletes(...): generating deletes produced error result")
-		return res
+		return err
 	}
 
-	deletes := ex.stepGen.ScheduleDeletes(deleteSteps)
+	deleteChains := ex.stepGen.ScheduleDeletes(deleteSteps)
 
 	// ScheduleDeletes gives us a list of lists of steps. Each list of steps can safely be executed
 	// in parallel, but each list must execute completes before the next list can safely begin
@@ -338,116 +396,124 @@ func (ex *deploymentExecutor) performDeletes(
 	// This is not "true" delete parallelism, since there may be resources that could safely begin
 	// deleting but we won't until the previous set of deletes fully completes. This approximation
 	// is conservative, but correct.
-	for _, antichain := range deletes {
+	erroredDeps := mapset.NewSet[*resource.State]()
+	seenErrors := mapset.NewSet[Step]()
+	for _, antichain := range deleteChains {
+		if ex.deployment.opts.ContinueOnError {
+			erroredSteps := ex.stepExec.GetErroredSteps()
+			for _, step := range erroredSteps {
+				// If we've already seen this error or the step isn't in the graph we can skip it.
+				//
+				// We also skip checking for dependencies of the error if it is not in the dependency graph.
+				// This can happen if an earlier create failed, thus the resource wouldn't have been added
+				// to the graph.  Since the resource was just tried to be  created it couldn't have any dependencies
+				// that should be deleted either.
+				if seenErrors.Contains(step) {
+					continue
+				}
+				for _, r := range []*resource.State{step.Res(), step.Old()} {
+					if r != nil && ex.deployment.depGraph.Contains(r) {
+						deps := ex.deployment.depGraph.TransitiveDependenciesOf(r)
+						erroredDeps = erroredDeps.Union(deps)
+					}
+				}
+			}
+			seenErrors.Append(erroredSteps...)
+			newChain := make([]Step, 0, len(antichain))
+			for _, step := range antichain {
+				if !erroredDeps.Contains(step.Res()) {
+					newChain = append(newChain, step)
+				}
+			}
+			antichain = newChain
+		}
 		logging.V(4).Infof("deploymentExecutor.Execute(...): beginning delete antichain")
 		tok := ex.stepExec.ExecuteParallel(antichain)
 		tok.Wait(ctx)
 		logging.V(4).Infof("deploymentExecutor.Execute(...): antichain complete")
 	}
 
-	// After executing targeted deletes, we may now have resources that depend on the resource that
-	// were deleted.  Go through and clean things up accordingly for them.
-	if targetsOpt != nil {
-		resourceToStep := make(map[*resource.State]Step)
-		for _, step := range deleteSteps {
-			resourceToStep[ex.deployment.olds[step.URN()]] = step
-		}
+	return nil
+}
 
-		ex.rebuildBaseState(resourceToStep, false /*refresh*/)
+func doesStepDependOn(step Step, skipped mapset.Set[urn.URN]) bool {
+	_, allDeps := step.Res().GetAllDependencies()
+	for _, dep := range allDeps {
+		if skipped.Contains(dep.URN) {
+			return true
+		}
 	}
 
-	return nil
+	return false
 }
 
 // handleSingleEvent handles a single source event. For all incoming events, it produces a chain that needs
 // to be executed and schedules the chain for execution.
-func (ex *deploymentExecutor) handleSingleEvent(event SourceEvent) result.Result {
-	contract.Require(event != nil, "event != nil")
+func (ex *deploymentExecutor) handleSingleEvent(event SourceEvent) error {
+	contract.Requiref(event != nil, "event", "must not be nil")
 
 	var steps []Step
-	var res result.Result
+	var err error
 	switch e := event.(type) {
 	case RegisterResourceEvent:
 		logging.V(4).Infof("deploymentExecutor.handleSingleEvent(...): received RegisterResourceEvent")
-		steps, res = ex.stepGen.GenerateSteps(e)
+		steps, err = ex.stepGen.GenerateSteps(e)
 	case ReadResourceEvent:
 		logging.V(4).Infof("deploymentExecutor.handleSingleEvent(...): received ReadResourceEvent")
-		steps, res = ex.stepGen.GenerateReadSteps(e)
+		steps, err = ex.stepGen.GenerateReadSteps(e)
 	case RegisterResourceOutputsEvent:
 		logging.V(4).Infof("deploymentExecutor.handleSingleEvent(...): received register resource outputs")
-		ex.stepExec.ExecuteRegisterResourceOutputs(e)
-		return nil
+		return ex.stepExec.ExecuteRegisterResourceOutputs(e)
 	}
 
-	if res != nil {
-		return res
+	if err != nil {
+		return err
 	}
-
-	ex.stepExec.ExecuteSerial(steps)
-	return nil
-}
-
-// retirePendingDeletes deletes all resources that are pending deletion. Run before the start of a deployment, this pass
-// ensures that the engine never sees any resources that are pending deletion from a previous deployment.
-//
-// retirePendingDeletes re-uses the deployment executor's step generator but uses its own step executor.
-func (ex *deploymentExecutor) retirePendingDeletes(callerCtx context.Context, opts Options,
-	preview bool) result.Result {
-
-	contract.Require(ex.stepGen != nil, "ex.stepGen != nil")
-	steps := ex.stepGen.GeneratePendingDeletes()
-	if len(steps) == 0 {
-		logging.V(4).Infoln("deploymentExecutor.retirePendingDeletes(...): no pending deletions")
-		return nil
-	}
-
-	logging.V(4).Infof("deploymentExecutor.retirePendingDeletes(...): executing %d steps", len(steps))
-	ctx, cancel := context.WithCancel(callerCtx)
-
-	stepExec := newStepExecutor(ctx, cancel, ex.deployment, opts, preview, false)
-	antichains := ex.stepGen.ScheduleDeletes(steps)
-	// Submit the deletes for execution and wait for them all to retire.
-	for _, antichain := range antichains {
-		for _, step := range antichain {
-			ex.deployment.Ctx().StatusDiag.Infof(diag.RawMessage(step.URN(), "completing deletion from previous update"))
+	// Exclude the steps that depend on errored steps if ContinueOnError is set.
+	var newSteps []Step
+	skipped := false
+	if ex.deployment.opts.ContinueOnError {
+		for _, errored := range ex.stepExec.GetErroredSteps() {
+			ex.skipped.Add(errored.Res().URN)
 		}
-
-		tok := stepExec.ExecuteParallel(antichain)
-		tok.Wait(ctx)
+		for _, step := range steps {
+			if doesStepDependOn(step, ex.skipped) {
+				step.Skip()
+				ex.skipped.Add(step.Res().URN)
+				skipped = true
+				continue
+			}
+			newSteps = append(newSteps, step)
+		}
+	} else {
+		newSteps = steps
 	}
 
-	stepExec.SignalCompletion()
-	stepExec.WaitForCompletion()
-
-	// Like Refresh, we use the presence of an error in the caller's context to detect whether or not we have been
-	// cancelled.
-	canceled := callerCtx.Err() != nil
-	if stepExec.Errored() {
-		ex.reportExecResult("failed", preview)
-		return result.Bail()
-	} else if canceled {
-		ex.reportExecResult("canceled", preview)
-		return result.Bail()
+	// If we pass an empty chain to the step executors the workers will shut down.  However we don't want that
+	// if we just skipped a step because its dependencies errored out.  Return early in that case.
+	if skipped && len(newSteps) == 0 {
+		return nil
 	}
+
+	ex.stepExec.ExecuteSerial(newSteps)
 	return nil
 }
 
 // import imports a list of resources into a stack.
-func (ex *deploymentExecutor) importResources(callerCtx context.Context, opts Options, preview bool) result.Result {
+func (ex *deploymentExecutor) importResources(callerCtx context.Context) (*Plan, error) {
 	if len(ex.deployment.imports) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Create an executor for this import.
 	ctx, cancel := context.WithCancel(callerCtx)
-	stepExec := newStepExecutor(ctx, cancel, ex.deployment, opts, preview, true)
+	stepExec := newStepExecutor(ctx, cancel, ex.deployment, true)
 
 	importer := &importer{
 		deployment: ex.deployment,
 		executor:   stepExec,
-		preview:    preview,
 	}
-	res := importer.importResources(ctx)
+	err := importer.importResources(ctx)
 	stepExec.SignalCompletion()
 	stepExec.WaitForCompletion()
 
@@ -455,31 +521,34 @@ func (ex *deploymentExecutor) importResources(callerCtx context.Context, opts Op
 	// cancellation from internally-initiated cancellation.
 	canceled := callerCtx.Err() != nil
 
-	if res != nil || stepExec.Errored() {
-		if res != nil && res.Error() != nil {
-			ex.reportExecResult(fmt.Sprintf("failed: %s", res.Error()), preview)
+	stepExecutorError := stepExec.Errored()
+	if err != nil || stepExecutorError != nil {
+		if err != nil && !result.IsBail(err) {
+			ex.reportExecResult(fmt.Sprintf("failed: %s", err))
 		} else {
-			ex.reportExecResult("failed", preview)
+			ex.reportExecResult("failed")
 		}
-		return result.Bail()
+		if err != nil {
+			return nil, result.BailError(err)
+		}
+		return nil, result.BailErrorf("step executor errored: %w", stepExecutorError)
 	} else if canceled {
-		ex.reportExecResult("canceled", preview)
-		return result.Bail()
+		ex.reportExecResult("canceled")
+		return nil, result.BailErrorf("canceled")
 	}
-	return nil
+	return ex.deployment.newPlans.plan(), nil
 }
 
 // refresh refreshes the state of the base checkpoint file for the current deployment in memory.
-func (ex *deploymentExecutor) refresh(callerCtx context.Context, opts Options, preview bool) result.Result {
+func (ex *deploymentExecutor) refresh(callerCtx context.Context) error {
 	prev := ex.deployment.prev
 	if prev == nil || len(prev.Resources) == 0 {
 		return nil
 	}
 
 	// Make sure if there were any targets specified, that they all refer to existing resources.
-	targetMapOpt := createTargetMap(opts.RefreshTargets)
-	if res := ex.checkTargets(opts.RefreshTargets, OpRefresh); res != nil {
-		return res
+	if err := ex.checkTargets(ex.deployment.opts.Targets); err != nil {
+		return err
 	}
 
 	// If the user did not provide any --target's, create a refresh step for each resource in the
@@ -488,7 +557,13 @@ func (ex *deploymentExecutor) refresh(callerCtx context.Context, opts Options, p
 	steps := []Step{}
 	resourceToStep := map[*resource.State]Step{}
 	for _, res := range prev.Resources {
-		if targetMapOpt == nil || targetMapOpt[res.URN] {
+		if ex.deployment.opts.Targets.Contains(res.URN) {
+			// For each resource we're going to refresh we need to ensure we have a provider for it
+			err := ex.deployment.EnsureProvider(res.Provider)
+			if err != nil {
+				return fmt.Errorf("could not load provider for resource %v: %w", res.URN, err)
+			}
+
 			step := NewRefreshStep(ex.deployment, res, nil)
 			steps = append(steps, step)
 			resourceToStep[res] = step
@@ -497,28 +572,30 @@ func (ex *deploymentExecutor) refresh(callerCtx context.Context, opts Options, p
 
 	// Fire up a worker pool and issue each refresh in turn.
 	ctx, cancel := context.WithCancel(callerCtx)
-	stepExec := newStepExecutor(ctx, cancel, ex.deployment, opts, preview, true)
+
+	stepExec := newStepExecutor(ctx, cancel, ex.deployment, true)
 	stepExec.ExecuteParallel(steps)
 	stepExec.SignalCompletion()
 	stepExec.WaitForCompletion()
 
-	ex.rebuildBaseState(resourceToStep, true /*refresh*/)
+	ex.rebuildBaseState(resourceToStep)
 
 	// NOTE: we use the presence of an error in the caller context in order to distinguish caller-initiated
 	// cancellation from internally-initiated cancellation.
 	canceled := callerCtx.Err() != nil
 
-	if stepExec.Errored() {
-		ex.reportExecResult("failed", preview)
-		return result.Bail()
+	stepExecutorError := stepExec.Errored()
+	if stepExecutorError != nil {
+		ex.reportExecResult("failed")
+		return result.BailErrorf("step executor errored: %w", stepExecutorError)
 	} else if canceled {
-		ex.reportExecResult("canceled", preview)
-		return result.Bail()
+		ex.reportExecResult("canceled")
+		return result.BailErrorf("canceled")
 	}
 	return nil
 }
 
-func (ex *deploymentExecutor) rebuildBaseState(resourceToStep map[*resource.State]Step, refresh bool) {
+func (ex *deploymentExecutor) rebuildBaseState(resourceToStep map[*resource.State]Step) {
 	// Rebuild this deployment's map of old resources and dependency graph, stripping out any deleted
 	// resources and repairing dependency lists as necessary. Note that this updates the base
 	// snapshot _in memory_, so it is critical that any components that use the snapshot refer to
@@ -565,22 +642,46 @@ func (ex *deploymentExecutor) rebuildBaseState(resourceToStep map[*resource.Stat
 		}
 
 		if new == nil {
-			if refresh {
-				contract.Assert(old.Custom)
-				contract.Assert(!providers.IsProviderType(old.Type))
-			}
+			contract.Assertf(old.Custom, "expected custom resource")
+			contract.Assertf(!providers.IsProviderType(old.Type), "expected non-provider resource")
 			continue
 		}
 
-		// Remove any deleted resources from this resource's dependency list.
-		if len(new.Dependencies) != 0 {
-			deps := make([]resource.URN, 0, len(new.Dependencies))
-			for _, d := range new.Dependencies {
-				if referenceable[d] {
-					deps = append(deps, d)
+		newDeps := []resource.URN{}
+		newPropDeps := map[resource.PropertyKey][]resource.URN{}
+
+		_, allDeps := new.GetAllDependencies()
+		for _, dep := range allDeps {
+			switch dep.Type {
+			case resource.ResourceParent:
+				// We handle parents separately later on (see undangleParentResources),
+				// so we'll skip over them here.
+				continue
+			case resource.ResourceDependency:
+				if referenceable[dep.URN] {
+					newDeps = append(newDeps, dep.URN)
+				}
+			case resource.ResourcePropertyDependency:
+				if referenceable[dep.URN] {
+					newPropDeps[dep.Key] = append(newPropDeps[dep.Key], dep.URN)
+				}
+			case resource.ResourceDeletedWith:
+				if !referenceable[dep.URN] {
+					new.DeletedWith = ""
 				}
 			}
-			new.Dependencies = deps
+		}
+
+		// Since we can only have shrunk the sets of dependencies and property
+		// dependencies, we'll only update them if they were non empty to begin
+		// with. This is to avoid e.g. replacing a nil input with an non-nil but
+		// empty output, which while equivalent in many cases is not the same and
+		// could result in subtly different behaviour in some parts of the engine.
+		if len(new.Dependencies) > 0 {
+			new.Dependencies = newDeps
+		}
+		if len(new.PropertyDependencies) > 0 {
+			new.PropertyDependencies = newPropDeps
 		}
 
 		// Add this resource to the resource list and mark it as referenceable.
@@ -593,6 +694,64 @@ func (ex *deploymentExecutor) rebuildBaseState(resourceToStep map[*resource.Stat
 		}
 	}
 
+	undangleParentResources(olds, resources)
+
 	ex.deployment.prev.Resources = resources
 	ex.deployment.olds, ex.deployment.depGraph = olds, graph.NewDependencyGraph(resources)
+}
+
+func undangleParentResources(undeleted map[resource.URN]*resource.State, resources []*resource.State) {
+	// Since a refresh may delete arbitrary resources, we need to handle the case where
+	// the parent of a still existing resource is deleted.
+	//
+	// Invalid parents need to be fixed since otherwise they leave the state invalid, and
+	// the user sees an error:
+	// ```
+	// snapshot integrity failure; refusing to use it: child resource ${validURN} refers to missing parent ${deletedURN}
+	// ```
+	// To solve the problem we traverse the topologically sorted list of resources in
+	// order, setting newly invalidated parent URNS to the URN of the parent's parent.
+	//
+	// This can be illustrated by an example. Consider the graph of resource parents:
+	//
+	//         A            xBx
+	//       /   \           |
+	//    xCx      D        xEx
+	//     |     /   \       |
+	//     F    G     xHx    I
+	//
+	// When a capital letter is marked for deletion, it is bracketed by `x`s.
+	// We can obtain a topological sort by reading left to right, top to bottom.
+	//
+	// A..D -> valid parents, so we do nothing
+	// E -> The parent of E is marked for deletion, so set E.Parent to E.Parent.Parent.
+	//      Since B (E's parent) has no parent, we set E.Parent to "".
+	// F -> The parent of F is marked for deletion, so set F.Parent to F.Parent.Parent.
+	//      We set F.Parent to "A"
+	// G, H -> valid parents, do nothing
+	// I -> The parent of I is marked for deletion, so set I.Parent to I.Parent.Parent.
+	//      The parent of I has parent "", (since we addressed the parent of E
+	//      previously), so we set I.Parent = "".
+	//
+	// The new graph looks like this:
+	//
+	//         A        xBx   xEx   I
+	//       / | \
+	//     xCx F  D
+	//          /   \
+	//         G    xHx
+	// We observe that it is perfectly valid for deleted nodes to be leaf nodes, but they
+	// cannot be intermediary nodes.
+	_, hasEmptyValue := undeleted[""]
+	contract.Assertf(!hasEmptyValue, "the zero value for an URN is not a valid URN")
+	availableParents := map[resource.URN]resource.URN{}
+	for _, r := range resources {
+		if _, ok := undeleted[r.Parent]; !ok {
+			// Since existing must obey a topological sort, we have already addressed
+			// p.Parent. Since we know that it doesn't dangle, and that r.Parent no longer
+			// exists, we set r.Parent as r.Parent.Parent.
+			r.Parent = availableParents[r.Parent]
+		}
+		availableParents[r.URN] = r.Parent
+	}
 }

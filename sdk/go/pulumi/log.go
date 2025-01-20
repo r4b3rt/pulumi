@@ -18,7 +18,6 @@ package pulumi
 
 import (
 	"strings"
-	"sync"
 
 	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
 	"golang.org/x/net/context"
@@ -37,7 +36,7 @@ type Log interface {
 type logState struct {
 	engine pulumirpc.EngineClient
 	ctx    context.Context
-	join   *sync.WaitGroup
+	join   *workGroup
 }
 
 // LogArgs may be used to specify arguments to be used for logging.
@@ -61,12 +60,12 @@ func (log *logState) Debug(msg string, args *LogArgs) error {
 	return log._log(pulumirpc.LogSeverity_DEBUG, msg, args)
 }
 
-// Logs an informational message that is generally printed to stdout during resource
+// Info logs an informational message that is generally printed to stdout during resource
 func (log *logState) Info(msg string, args *LogArgs) error {
 	return log._log(pulumirpc.LogSeverity_INFO, msg, args)
 }
 
-// Logs a warning to indicate that something went wrong, but not catastrophically so.
+// Warn logs a warning to indicate that something went wrong, but not catastrophically so.
 func (log *logState) Warn(msg string, args *LogArgs) error {
 	return log._log(pulumirpc.LogSeverity_WARNING, msg, args)
 }
